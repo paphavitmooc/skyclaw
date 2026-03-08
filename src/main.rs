@@ -149,6 +149,9 @@ fn load_saved_credentials() -> Option<(String, String, String)> {
     let name = provider.get("name")?.as_str()?.to_string();
     let key = provider.get("api_key")?.as_str()?.to_string();
     let model = provider.get("model")?.as_str()?.to_string();
+    if name.is_empty() || key.is_empty() {
+        return None;
+    }
     Some((name, key, model))
 }
 
