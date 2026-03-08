@@ -68,10 +68,12 @@ pub fn create_tools(
         tools.push(Arc::new(CheckMessagesTool::new(pending)));
     }
 
-    // browser: headless Chrome automation
+    // browser: headless Chrome automation (stealth mode)
     #[cfg(feature = "browser")]
     if config.browser {
-        tools.push(Arc::new(BrowserTool::new()));
+        tools.push(Arc::new(BrowserTool::with_timeout(
+            config.browser_timeout_secs,
+        )));
     }
 
     tracing::info!(count = tools.len(), "Tools registered");

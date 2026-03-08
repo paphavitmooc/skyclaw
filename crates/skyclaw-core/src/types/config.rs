@@ -393,6 +393,10 @@ pub struct ToolsConfig {
     pub cron: bool,
     #[serde(default = "default_true")]
     pub http: bool,
+    /// Browser idle timeout in seconds before auto-close (default: 300).
+    /// Increased from 120s to support authenticated sessions that take longer.
+    #[serde(default = "default_browser_timeout_secs")]
+    pub browser_timeout_secs: u64,
 }
 
 impl Default for ToolsConfig {
@@ -404,8 +408,13 @@ impl Default for ToolsConfig {
             git: true,
             cron: true,
             http: true,
+            browser_timeout_secs: 300,
         }
     }
+}
+
+fn default_browser_timeout_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,6 +556,12 @@ impl AgentAccessibleConfig {
             ));
         }
 
+        if self.tools.browser_timeout_secs > 86400 {
+            return Err(SkyclawError::Config(
+                "tools.browser_timeout_secs must be <= 86400 (24 hours)".to_string(),
+            ));
+        }
+
         let valid_levels = ["trace", "debug", "info", "warn", "error"];
         if !valid_levels.contains(&self.observability.log_level.to_lowercase().as_str()) {
             return Err(SkyclawError::Config(format!(
@@ -673,6 +688,7 @@ mod tests {
                 git: false,
                 cron: false,
                 http: true,
+                browser_timeout_secs: 300,
             },
             memory: MemoryConfig {
                 backend: "sqlite".to_string(),
@@ -719,6 +735,7 @@ mod tests {
                 git: true,
                 cron: false,
                 http: false,
+                browser_timeout_secs: 300,
             },
             heartbeat: HeartbeatConfig {
                 enabled: true,
@@ -867,6 +884,78 @@ mod tests {
         assert!(!path.exists());
     }
 
+    // ── Browser timeout config tests ─────────────────────────────────
+
+    #[test]
+    fn browser_timeout_secs_default_is_300() {
+        let tools = ToolsConfig::default();
+        assert_eq!(tools.browser_timeout_secs, 300);
+    }
+
+    #[test]
+    fn browser_timeout_secs_deserialize_default() {
+        // When browser_timeout_secs is not specified, it should default to 300
+        let toml_str = r#"
+            shell = true
+            browser = true
+            file = true
+            git = true
+            cron = true
+            http = true
+        "#;
+        let config: ToolsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.browser_timeout_secs, 300);
+    }
+
+    #[test]
+    fn browser_timeout_secs_deserialize_custom() {
+        let toml_str = r#"
+            shell = true
+            browser = true
+            file = true
+            git = true
+            cron = true
+            http = true
+            browser_timeout_secs = 600
+        "#;
+        let config: ToolsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.browser_timeout_secs, 600);
+    }
+
+    #[test]
+    fn browser_timeout_secs_serialize_roundtrip() {
+        let tools = ToolsConfig {
+            browser_timeout_secs: 120,
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&tools).unwrap();
+        let restored: ToolsConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(restored.browser_timeout_secs, 120);
+    }
+
+    #[test]
+    fn browser_timeout_secs_in_full_config() {
+        let toml_str = r#"
+            [tools]
+            shell = true
+            browser = true
+            file = true
+            git = true
+            cron = true
+            http = true
+            browser_timeout_secs = 900
+        "#;
+        let config: SkyclawConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.tools.browser_timeout_secs, 900);
+    }
+
+    #[test]
+    fn browser_timeout_secs_default_in_full_config() {
+        // Full config with no tools section should default to 300
+        let config = SkyclawConfig::default();
+        assert_eq!(config.tools.browser_timeout_secs, 300);
+    }
+
     #[test]
     fn agent_config_serde_roundtrip() {
         let cfg = AgentAccessibleConfig {
@@ -884,6 +973,7 @@ mod tests {
                 git: true,
                 cron: false,
                 http: true,
+                browser_timeout_secs: 300,
             },
             heartbeat: HeartbeatConfig {
                 enabled: true,

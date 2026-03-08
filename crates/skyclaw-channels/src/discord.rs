@@ -319,6 +319,43 @@ impl Channel for DiscordChannel {
     fn is_allowed(&self, user_id: &str) -> bool {
         self.check_allowed(user_id)
     }
+
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<(), SkyclawError> {
+        let http = {
+            let guard = self.http.read().unwrap();
+            guard
+                .clone()
+                .ok_or_else(|| SkyclawError::Channel("Discord client not connected yet".into()))?
+        };
+
+        let channel_id: ChannelId = chat_id.parse::<u64>().map(ChannelId::new).map_err(|_| {
+            SkyclawError::Channel(format!("Invalid Discord channel_id: {}", chat_id))
+        })?;
+
+        let msg_id: serenity::all::MessageId = message_id
+            .parse::<u64>()
+            .map(serenity::all::MessageId::new)
+            .map_err(|_| {
+                SkyclawError::Channel(format!("Invalid Discord message_id: {}", message_id))
+            })?;
+
+        channel_id
+            .delete_message(&http, msg_id)
+            .await
+            .map_err(|e| {
+                SkyclawError::Channel(format!(
+                    "Failed to delete Discord message {}: {}",
+                    message_id, e
+                ))
+            })?;
+
+        tracing::info!(
+            chat_id = %chat_id,
+            message_id = %message_id,
+            "Deleted sensitive message from Discord channel"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -943,5 +980,43 @@ mod tests {
         // the full Discord API, so we test the split_message helper instead.
         // The extract_attachments function is a trivial mapping and will be
         // validated by integration tests.
+    }
+
+    // ── delete_message trait method existence ─────────────────────────
+    // We verify the method exists by confirming DiscordChannel implements
+    // the Channel trait (which now includes delete_message).
+
+    #[test]
+    fn discord_channel_implements_channel_trait() {
+        let config = ChannelConfig {
+            enabled: true,
+            token: Some("test-token".to_string()),
+            allowlist: Vec::new(),
+            file_transfer: true,
+            max_file_size: None,
+        };
+        let channel = DiscordChannel::new(&config).unwrap();
+        // If this compiles, DiscordChannel implements Channel (including delete_message)
+        let _: &dyn Channel = &channel;
+    }
+
+    #[tokio::test]
+    async fn discord_delete_message_requires_client_connected() {
+        let config = ChannelConfig {
+            enabled: true,
+            token: Some("test-token".to_string()),
+            allowlist: Vec::new(),
+            file_transfer: true,
+            max_file_size: None,
+        };
+        let channel = DiscordChannel::new(&config).unwrap();
+        // delete_message should fail because the client is not connected
+        let result = channel.delete_message("123456789", "987654321").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not connected"),
+            "Should fail with 'not connected', got: {err}"
+        );
     }
 }

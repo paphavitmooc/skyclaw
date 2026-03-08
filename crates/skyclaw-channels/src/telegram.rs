@@ -268,6 +268,37 @@ impl Channel for TelegramChannel {
     fn is_allowed(&self, user_id: &str) -> bool {
         self.check_allowed(user_id, None)
     }
+
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<(), SkyclawError> {
+        let bot = self
+            .bot
+            .as_ref()
+            .ok_or_else(|| SkyclawError::Channel("Telegram bot not started".into()))?;
+
+        let tg_chat_id: ChatId = chat_id
+            .parse::<i64>()
+            .map(ChatId)
+            .map_err(|_| SkyclawError::Channel(format!("Invalid chat_id: {}", chat_id)))?;
+
+        let msg_id: teloxide::types::MessageId =
+            teloxide::types::MessageId(message_id.parse::<i32>().map_err(|_| {
+                SkyclawError::Channel(format!("Invalid message_id: {}", message_id))
+            })?);
+
+        bot.delete_message(tg_chat_id, msg_id).await.map_err(|e| {
+            SkyclawError::Channel(format!(
+                "Failed to delete Telegram message {}: {}",
+                message_id, e
+            ))
+        })?;
+
+        tracing::info!(
+            chat_id = %chat_id,
+            message_id = %message_id,
+            "Deleted sensitive message from Telegram chat"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -667,4 +698,133 @@ fn extract_attachments(msg: &teloxide::types::Message) -> Vec<AttachmentRef> {
     }
 
     attachments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(token: Option<&str>, allowlist: Vec<String>) -> ChannelConfig {
+        ChannelConfig {
+            enabled: true,
+            token: token.map(|t| t.to_string()),
+            allowlist,
+            file_transfer: true,
+            max_file_size: None,
+        }
+    }
+
+    #[test]
+    fn create_telegram_channel_requires_token() {
+        let config = test_config(None, Vec::new());
+        let result = TelegramChannel::new(&config);
+        assert!(result.is_err());
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => unreachable!(),
+        };
+        assert!(err.contains("bot token"), "error was: {err}");
+    }
+
+    #[test]
+    fn create_telegram_channel_with_token() {
+        let config = test_config(Some("123456:ABC-DEF1234"), Vec::new());
+        let channel = TelegramChannel::new(&config).unwrap();
+        assert_eq!(channel.name(), "telegram");
+    }
+
+    #[test]
+    fn telegram_channel_name() {
+        let config = test_config(Some("test-token"), Vec::new());
+        let channel = TelegramChannel::new(&config).unwrap();
+        assert_eq!(channel.name(), "telegram");
+    }
+
+    #[test]
+    fn telegram_empty_allowlist_denies_all() {
+        let config = test_config(Some("test-token"), Vec::new());
+        let channel = TelegramChannel::new(&config).unwrap();
+        // Force empty allowlist to avoid interference from persisted file
+        {
+            let mut list = channel.allowlist.write().unwrap();
+            list.clear();
+        }
+        // Empty allowlist = deny all (DF-16)
+        assert!(!channel.is_allowed("123456"));
+        assert!(!channel.is_allowed("anyone"));
+    }
+
+    #[test]
+    fn telegram_allowlist_matches_user_ids() {
+        let config = test_config(Some("test-token"), Vec::new());
+        let channel = TelegramChannel::new(&config).unwrap();
+        // Manually set the allowlist to avoid interference from persisted
+        // allowlist file at ~/.skyclaw/allowlist.toml
+        {
+            let mut list = channel.allowlist.write().unwrap();
+            *list = vec!["111222333".to_string(), "444555666".to_string()];
+        }
+        assert!(channel.is_allowed("111222333"));
+        assert!(channel.is_allowed("444555666"));
+        assert!(!channel.is_allowed("999888777"));
+        // Must match exact ID, not username
+        assert!(!channel.is_allowed("SomeUsername"));
+    }
+
+    #[test]
+    fn telegram_file_transfer_available() {
+        let config = test_config(Some("test-token"), Vec::new());
+        let channel = TelegramChannel::new(&config).unwrap();
+        assert!(channel.file_transfer().is_some());
+    }
+
+    #[test]
+    fn telegram_max_file_size() {
+        let config = test_config(Some("test-token"), Vec::new());
+        let channel = TelegramChannel::new(&config).unwrap();
+        assert_eq!(
+            channel.file_transfer().unwrap().max_file_size(),
+            50 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn telegram_take_receiver() {
+        let config = test_config(Some("test-token"), Vec::new());
+        let mut channel = TelegramChannel::new(&config).unwrap();
+        // First take should succeed
+        assert!(channel.take_receiver().is_some());
+        // Second take should return None
+        assert!(channel.take_receiver().is_none());
+    }
+
+    // ── delete_message trait method existence ─────────────────────────
+    // We cannot call the actual Telegram API, but we verify the method
+    // exists and has the correct signature by checking that the struct
+    // implements Channel (which includes delete_message).
+
+    #[test]
+    fn telegram_channel_implements_channel_trait() {
+        let config = test_config(Some("test-token"), Vec::new());
+        let channel = TelegramChannel::new(&config).unwrap();
+        // If this compiles, TelegramChannel implements Channel (including delete_message)
+        let _: &dyn Channel = &channel;
+    }
+
+    #[tokio::test]
+    async fn telegram_delete_message_requires_bot_started() {
+        let config = test_config(Some("test-token"), Vec::new());
+        let channel = TelegramChannel::new(&config).unwrap();
+        // delete_message should fail because the bot is not started
+        let result = channel.delete_message("123", "456").await;
+        assert!(result.is_err());
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => unreachable!(),
+        };
+        assert!(
+            err.contains("not started"),
+            "Should fail with 'not started', got: {err}"
+        );
+    }
 }

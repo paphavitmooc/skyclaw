@@ -87,8 +87,8 @@ pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn Provider>, Sky
             Ok(Box::new(provider))
         }
         _ => {
-            let mut provider = OpenAICompatProvider::new(api_key)
-                .with_extra_headers(config.extra_headers.clone());
+            let mut provider =
+                OpenAICompatProvider::new(api_key).with_extra_headers(config.extra_headers.clone());
             if let Some(ref base_url) = config.base_url {
                 provider = provider.with_base_url(base_url.clone());
             }

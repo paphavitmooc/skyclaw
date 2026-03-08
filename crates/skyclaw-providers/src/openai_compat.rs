@@ -382,11 +382,10 @@ impl Provider for OpenAICompatProvider {
         for (k, v) in &self.extra_headers {
             req = req.header(k.as_str(), v.as_str());
         }
-        let response = req
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| SkyclawError::Provider(format!("OpenAI-compat request failed: {e}")))?;
+        let response =
+            req.json(&body).send().await.map_err(|e| {
+                SkyclawError::Provider(format!("OpenAI-compat request failed: {e}"))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -468,13 +467,9 @@ impl Provider for OpenAICompatProvider {
         for (k, v) in &self.extra_headers {
             req = req.header(k.as_str(), v.as_str());
         }
-        let response = req
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                SkyclawError::Provider(format!("OpenAI-compat stream request failed: {e}"))
-            })?;
+        let response = req.json(&body).send().await.map_err(|e| {
+            SkyclawError::Provider(format!("OpenAI-compat stream request failed: {e}"))
+        })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -924,8 +919,7 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("HTTP-Referer".to_string(), "https://myapp.com".to_string());
         headers.insert("X-Title".to_string(), "SkyClaw".to_string());
-        let provider = OpenAICompatProvider::new("key".to_string())
-            .with_extra_headers(headers);
+        let provider = OpenAICompatProvider::new("key".to_string()).with_extra_headers(headers);
         assert_eq!(provider.extra_headers.len(), 2);
         assert_eq!(provider.extra_headers["HTTP-Referer"], "https://myapp.com");
     }
@@ -975,7 +969,9 @@ mod tests {
 
     #[test]
     fn sse_midstream_error_without_content() {
-        let mut buffer = "data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n".to_string();
+        let mut buffer =
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n"
+                .to_string();
         let mut tool_calls = Vec::new();
 
         let result = extract_openai_sse_event(&mut buffer, &mut tool_calls);

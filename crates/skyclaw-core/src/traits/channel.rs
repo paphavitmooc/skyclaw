@@ -25,6 +25,15 @@ pub trait Channel: Send + Sync {
 
     /// Check if a user is allowed to use this channel
     fn is_allowed(&self, user_id: &str) -> bool;
+
+    /// Delete a message from a chat by its ID.
+    ///
+    /// Used to remove sensitive content (API keys, credentials) from chat
+    /// history after ingestion. Default implementation is a no-op for channels
+    /// that don't support deletion (e.g. CLI).
+    async fn delete_message(&self, _chat_id: &str, _message_id: &str) -> Result<(), SkyclawError> {
+        Ok(())
+    }
 }
 
 /// Bi-directional file transfer sub-trait. Every messaging channel should implement this.

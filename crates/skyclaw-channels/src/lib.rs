@@ -110,4 +110,23 @@ mod tests {
         let result = create_channel("smoke_signal", &config, "/tmp".into());
         assert!(result.is_err());
     }
+
+    // ── CLI channel delete_message default no-op ─────────────────────
+    // The CLI channel does not override delete_message, so it inherits
+    // the Channel trait's default no-op implementation.
+
+    #[tokio::test]
+    async fn cli_delete_message_is_noop() {
+        let channel = CliChannel::new("/tmp".into());
+        // delete_message should succeed silently (no-op)
+        let result = channel.delete_message("cli", "123").await;
+        assert!(result.is_ok(), "CLI delete_message should be a no-op");
+    }
+
+    #[test]
+    fn cli_channel_implements_channel_trait() {
+        let channel = CliChannel::new("/tmp".into());
+        // If this compiles, CliChannel implements Channel (including delete_message)
+        let _: &dyn Channel = &channel;
+    }
 }

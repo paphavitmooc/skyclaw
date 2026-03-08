@@ -393,6 +393,47 @@ impl Channel for SlackChannel {
     fn is_allowed(&self, user_id: &str) -> bool {
         self.check_allowed(user_id)
     }
+
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<(), SkyclawError> {
+        let response: serde_json::Value = self
+            .client
+            .post(format!("{}/chat.delete", SLACK_API_BASE))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "channel": chat_id,
+                "ts": message_id
+            }))
+            .send()
+            .await
+            .map_err(|e| SkyclawError::Channel(format!("Failed to call Slack chat.delete: {}", e)))?
+            .json()
+            .await
+            .map_err(|e| {
+                SkyclawError::Channel(format!("Failed to parse Slack chat.delete response: {}", e))
+            })?;
+
+        let ok = response
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !ok {
+            let error = response
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            return Err(SkyclawError::Channel(format!(
+                "Slack chat.delete failed: {}",
+                error
+            )));
+        }
+
+        tracing::info!(
+            chat_id = %chat_id,
+            message_id = %message_id,
+            "Deleted sensitive message from Slack channel"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1285,5 +1326,17 @@ mod tests {
         let debug = format!("{:?}", channel);
         assert!(!debug.contains("xoxb-super-secret-token"));
         assert!(debug.contains("SlackChannel"));
+    }
+
+    // ── delete_message trait method existence ─────────────────────────
+    // We verify the method exists by confirming SlackChannel implements
+    // the Channel trait (which now includes delete_message).
+
+    #[test]
+    fn slack_channel_implements_channel_trait() {
+        let config = test_config(Some("xoxb-test"), Vec::new());
+        let channel = SlackChannel::new(&config).unwrap();
+        // If this compiles, SlackChannel implements Channel (including delete_message)
+        let _: &dyn Channel = &channel;
     }
 }
