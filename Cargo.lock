@@ -19,6 +19,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
+name = "aes-gcm"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ghash",
+ "subtle",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1347,6 +1372,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctr"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1936,6 +1970,16 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
+]
+
+[[package]]
+name = "ghash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
+dependencies = [
+ "opaque-debug",
+ "polyval",
 ]
 
 [[package]]
@@ -3113,6 +3157,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyval"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4044,11 +4100,16 @@ dependencies = [
 
 [[package]]
 name = "skyclaw"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
+ "async-trait",
+ "base64",
  "clap",
  "dirs",
+ "hex",
+ "rand 0.8.5",
  "serde",
  "skyclaw-agent",
  "skyclaw-automation",
@@ -4070,7 +4131,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-agent"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -4091,7 +4152,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-automation"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "chrono",
  "skyclaw-core",
@@ -4102,7 +4163,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-channels"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4127,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-core"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4150,7 +4211,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-filestore"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4168,12 +4229,13 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-gateway"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "axum",
  "base64",
  "chrono",
+ "hex",
  "rand 0.8.5",
  "reqwest",
  "rustls 0.23.37",
@@ -4194,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-memory"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4212,7 +4274,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-observable"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "opentelemetry",
@@ -4226,7 +4288,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-providers"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -4241,7 +4303,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-skills"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "dirs",
  "serde",
@@ -4254,7 +4316,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-test-utils"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4269,7 +4331,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-tools"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4289,7 +4351,7 @@ dependencies = [
 
 [[package]]
 name = "skyclaw-vault"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "base64",

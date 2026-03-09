@@ -10,14 +10,14 @@
   <a href="https://github.com/nagisanzenin/skyclaw/stargazers"><img src="https://img.shields.io/github/stars/nagisanzenin/skyclaw?style=flat&color=gold&logo=github" alt="GitHub Stars"></a>
   <a href="https://discord.gg/3ux2c5xz"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/version-1.4.0-blue.svg" alt="Version">
-  <img src="https://img.shields.io/badge/tests-1061-green.svg" alt="1061 tests">
+  <img src="https://img.shields.io/badge/version-1.5.0-blue.svg" alt="Version">
+  <img src="https://img.shields.io/badge/tests-1095-green.svg" alt="1095 tests">
   <img src="https://img.shields.io/badge/providers-6-red.svg" alt="6 providers">
 </p>
 
 # SkyClaw
 
-Hyper-performance (Rust) & self-learning claw that lives indefinitely in Cloud. Learns from every task, remembers across sessions. 42K lines, 1061 tests, zero warnings.
+Hyper-performance (Rust) & self-learning claw that lives indefinitely in Cloud. Learns from every task, remembers across sessions. 44K lines, 1095 tests, zero warnings.
 
 ## What It Does
 
@@ -59,21 +59,21 @@ ORDER ─→ THINK ─→ ACTION ─→ VERIFY ─┐
 
 | Metric | Value |
 |--------|-------|
-| **Lines of Rust** | 42,687 across 98 source files |
-| **Tests** | 1,061 passing, 0 failures |
+| **Lines of Rust** | 44,074 across 101 source files |
+| **Tests** | 1,095 passing, 0 failures |
 | **Clippy warnings** | 0 (CI gate: `-D warnings`) |
 | **Workspace crates** | 13 + 1 binary |
-| **Implemented features** | 46 across 9 phases |
+| **Implemented features** | 49 across 9 phases |
 | **AGENTIC CORE modules** | 20 |
-| **Traits (core)** | 13 shared trait definitions |
+| **Traits (core)** | 14 shared trait definitions |
 | **AI providers** | 6 (Anthropic, OpenAI, Gemini, Grok, OpenRouter, MiniMax) |
 | **Messaging channels** | 4 ([Telegram](docs/channels/telegram.md), [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [CLI](docs/channels/cli.md)) |
-| **Agent tools** | 8 (shell, browser, file ops, web fetch, git, messaging, file transfer, memory manage) |
-| **Encryption** | ChaCha20-Poly1305 + Ed25519 |
+| **Agent tools** | 9 (shell, browser, file ops, web fetch, git, messaging, file transfer, memory manage, key manage) |
+| **Encryption** | ChaCha20-Poly1305 + Ed25519 + AES-256-GCM (OTK) |
 | **Memory backends** | 3 (SQLite, Markdown, failover) |
 | **File storage** | 2 (local, S3/R2) |
 | **Observability** | OpenTelemetry, 6 predefined metrics |
-| **Security features** | Auto-whitelist, vault encryption, path traversal protection, force-push block, credential message deletion, 4-layer key validation |
+| **Security features** | Auto-whitelist, vault encryption, path traversal protection, force-push block, credential message deletion, 4-layer key validation, OTK secure key setup, secret output filter |
 | **Vision support** | JPEG, PNG, GIF, WebP (Anthropic + OpenAI formats) |
 | **Release profile** | `opt-level=z`, LTO, 1 codegen unit, stripped, `panic=abort` |
 | **Minimum Rust version** | 1.82 (Edition 2021) |
@@ -120,9 +120,12 @@ export TELEGRAM_BOT_TOKEN="your-token-here"
 ### Step 3: Activate
 
 1. Open your bot in Telegram
-2. Send any message — SkyClaw asks for your API key
-3. Paste your API key (Anthropic, OpenAI, Gemini, Grok, or OpenRouter)
-4. SkyClaw validates it against the real API and goes online
+2. Send any message — SkyClaw sends you a secure setup link
+3. Click the link, paste your API key in the browser form — it encrypts locally
+4. Copy the encrypted blob back to chat — SkyClaw decrypts and validates
+5. Or just paste a raw API key directly — SkyClaw auto-detects the provider
+
+Supports: Anthropic, OpenAI, Gemini, Grok, OpenRouter, MiniMax
 
 ## Supported Providers
 
@@ -158,6 +161,7 @@ Paste any of these API keys in Telegram — SkyClaw detects the provider automat
 | **Messaging** | Send real-time updates during multi-step tasks |
 | **File transfer** | Send/receive files through messaging channels |
 | **Memory manage** | Persistent knowledge CRUD — remember, recall, forget, update, list |
+| **Key manage** | Generates secure setup links for API key onboarding — agent can send OTK links directly |
 
 ## Vision Support
 
@@ -199,6 +203,8 @@ skyclaw (binary)
 - **Path traversal protection**: File names sanitized, directory components stripped.
 - **Force-push blocked**: Git tool blocks destructive operations by default.
 - **Credential message deletion**: API keys and passwords are auto-deleted from chat history after reading.
+- **OTK secure key setup**: API keys encrypted client-side via AES-256-GCM before transit. [Design doc](docs/OTK_SECURE_KEY_SETUP.md)
+- **Secret output filter**: Hardcoded string-match censor prevents API keys from leaking in agent replies. System prompt enforces one-way secret flow (user → claw, never claw → user).
 
 ## Self-Configuration
 
@@ -225,7 +231,7 @@ skyclaw version            Show version info
 ```bash
 cargo check --workspace                                    # Quick compilation check
 cargo build --workspace                                    # Debug build
-cargo test --workspace                                     # Run all 1061 tests
+cargo test --workspace                                     # Run all 1095 tests
 cargo clippy --workspace --all-targets --all-features -- -D warnings  # Lint (0 warnings)
 cargo fmt --all                                            # Format
 cargo build --release                                      # Release build
@@ -240,6 +246,8 @@ cargo build --release                                      # Release build
 ## Release Timeline
 
 ```
+2026-03-09  v1.5.0  ●━━━ OTK secure key setup — AES-256-GCM encrypted onboarding, key_manage tool, secret output filter, SetupLinkGenerator trait, 1095 tests
+                    │
 2026-03-09  v1.4.0  ●━━━ Persistent memory & budget — memory_manage tool (CRUD), knowledge auto-injection, budget tracking, CLI chat, 1061 tests
                     │
 2026-03-09  v1.3.0  ●━━━ Hyper-performance — 4-layer key validation, dynamic system prompt, placeholder defense, 1027 tests

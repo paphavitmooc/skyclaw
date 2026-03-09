@@ -7,6 +7,8 @@ pub mod identity;
 pub mod router;
 pub mod server;
 pub mod session;
+pub mod setup_tokens;
 
 pub use identity::OAuthIdentityManager;
 pub use server::SkyGate;
+pub use setup_tokens::SetupTokenStore;

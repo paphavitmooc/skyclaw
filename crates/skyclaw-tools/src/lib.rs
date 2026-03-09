@@ -5,6 +5,7 @@ mod browser;
 mod check_messages;
 mod file;
 mod git;
+mod key_manage;
 mod memory_manage;
 mod send_file;
 mod send_message;
@@ -16,6 +17,7 @@ pub use browser::BrowserTool;
 pub use check_messages::{CheckMessagesTool, PendingMessages};
 pub use file::{FileListTool, FileReadTool, FileWriteTool};
 pub use git::GitTool;
+pub use key_manage::KeyManageTool;
 pub use memory_manage::MemoryManageTool;
 pub use send_file::SendFileTool;
 pub use send_message::SendMessageTool;
@@ -23,18 +25,20 @@ pub use shell::ShellTool;
 pub use web_fetch::WebFetchTool;
 
 use skyclaw_core::types::config::ToolsConfig;
-use skyclaw_core::{Channel, Memory, Tool};
+use skyclaw_core::{Channel, Memory, SetupLinkGenerator, Tool};
 use std::sync::Arc;
 
 /// Create tools based on the configuration flags.
 /// Pass an optional channel for file transfer tools, an optional
-/// pending-message queue for the check_messages tool, and an optional
-/// memory backend for the memory_manage tool.
+/// pending-message queue for the check_messages tool, an optional
+/// memory backend for the memory_manage tool, and an optional
+/// setup link generator for the key_manage tool.
 pub fn create_tools(
     config: &ToolsConfig,
     channel: Option<Arc<dyn Channel>>,
     pending_messages: Option<PendingMessages>,
     memory: Option<Arc<dyn Memory>>,
+    setup_link_gen: Option<Arc<dyn SetupLinkGenerator>>,
 ) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
@@ -76,6 +80,9 @@ pub fn create_tools(
     if let Some(mem) = memory {
         tools.push(Arc::new(MemoryManageTool::new(mem)));
     }
+
+    // key_manage: generates setup links and guides users through key operations
+    tools.push(Arc::new(KeyManageTool::new(setup_link_gen)));
 
     // browser: headless Chrome automation (stealth mode)
     #[cfg(feature = "browser")]

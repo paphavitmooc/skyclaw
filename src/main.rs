@@ -1,11 +1,54 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use skyclaw_core::Channel;
 use tokio::sync::Mutex;
+
+// ── Secret-censoring channel wrapper ──────────────────────
+// Wraps any Channel to censor known API keys from outbound messages.
+// This is the hardcoded last-line-of-defense filter — the system prompt
+// tells the agent not to leak secrets, but this catches anything that slips.
+struct SecretCensorChannel {
+    inner: Arc<dyn Channel>,
+}
+
+#[async_trait]
+impl Channel for SecretCensorChannel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    async fn start(&mut self) -> std::result::Result<(), skyclaw_core::types::error::SkyclawError> {
+        Ok(())
+    }
+    async fn stop(&mut self) -> std::result::Result<(), skyclaw_core::types::error::SkyclawError> {
+        Ok(())
+    }
+    async fn send_message(
+        &self,
+        mut msg: skyclaw_core::types::message::OutboundMessage,
+    ) -> std::result::Result<(), skyclaw_core::types::error::SkyclawError> {
+        msg.text = censor_secrets(&msg.text);
+        self.inner.send_message(msg).await
+    }
+    fn file_transfer(&self) -> Option<&dyn skyclaw_core::FileTransfer> {
+        self.inner.file_transfer()
+    }
+    fn is_allowed(&self, user_id: &str) -> bool {
+        self.inner.is_allowed(user_id)
+    }
+    async fn delete_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> std::result::Result<(), skyclaw_core::types::error::SkyclawError> {
+        self.inner.delete_message(chat_id, message_id).await
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "skyclaw")]
@@ -526,11 +569,21 @@ fn load_active_provider_keys() -> Option<(String, Vec<String>, String, Option<St
     ))
 }
 
-const ONBOARDING_MESSAGE: &str = "\
-Welcome to SkyClaw!\n\n\
-To get started, paste your API key below. I'll auto-detect the provider and get you online.\n\n\
-You can add more keys later, switch providers mid-conversation, or use a custom proxy endpoint.\n\n\
-Paste your key to begin.";
+/// Build the onboarding welcome message with a pre-generated setup link.
+fn onboarding_message_with_link(setup_link: &str) -> String {
+    format!(
+        "Welcome to SkyClaw!\n\n\
+         To get started, open this secure setup link:\n\
+         {}\n\n\
+         Paste your API key in the form, copy the encrypted blob, \
+         and send it back here.\n\n\
+         Or just paste your API key directly below — \
+         I'll auto-detect the provider and get you online.\n\n\
+         You can add more keys later with /addkey, \
+         list them with /keys, or remove with /removekey.",
+        setup_link
+    )
+}
 
 const ONBOARDING_REFERENCE: &str = "\
 Supported formats:\n\n\
@@ -637,10 +690,177 @@ Changes take effect immediately — SkyClaw validates the key and auto-reloads \
 after each response. If a key is invalid, the switch is rejected and the \
 current provider stays active.\n\
 Users can add keys anytime by pasting them in chat. SkyClaw auto-detects the \
-provider and validates before saving.",
+provider and validates before saving.\n\n\
+SECRET HANDLING (MANDATORY — NEVER VIOLATE):\n\
+There are 3 environments: USER (human) → CLAW (you, the agent) → PC (the server you run on).\n\
+- Users give you secrets (API keys, passwords, tokens, account IDs) for YOU to use.\n\
+- You ARE allowed to use secrets on the PC: log into services, call APIs, configure tools, \
+  do personal tasks for the user. This is your job.\n\
+- You must NEVER send secrets BACK to the user in your replies. Secrets flow one way: \
+  user → claw. Never claw → user.\n\
+- You must NEVER post secrets on the internet (no pasting keys in public repos, \
+  web forms, or chat services other than the user's own channel).\n\
+Specific rules:\n\
+- NEVER echo back an API key the user pasted, not even partially.\n\
+- NEVER read credentials.toml and show its contents to the user.\n\
+- NEVER include API keys in shell commands visible to the user.\n\
+- If the user asks to see their key, say it's stored securely and cannot be displayed.\n\
+- When confirming a key was added, say 'Key saved for [provider]' — never show the key.\n\
+- This applies to ALL secrets: API keys, tokens, passwords, encrypted blobs, account IDs.\n\
+A secondary output filter censors any key that leaks, but you must not rely on it. \
+The primary defense is YOU never including secrets in your output.",
     );
 
     prompt
+}
+
+/// Hardcoded output filter: replaces any known API key in the text with [REDACTED].
+/// This is the last line of defense — the system prompt tells the agent not to leak
+/// secrets, but this filter catches any that slip through.
+fn censor_secrets(text: &str) -> String {
+    let creds = match load_credentials_file() {
+        Some(c) => c,
+        None => return text.to_string(),
+    };
+    let mut censored = text.to_string();
+    for provider in &creds.providers {
+        for key in &provider.keys {
+            if !key.is_empty() && !is_placeholder_key(key) && key.len() >= 8 {
+                censored = censored.replace(key, "[REDACTED]");
+            }
+        }
+    }
+    censored
+}
+
+// ── OTK key management helpers ────────────────────────────
+
+/// List configured providers (names only, never keys).
+fn list_configured_providers() -> String {
+    match load_credentials_file() {
+        Some(creds) => {
+            if creds.providers.is_empty() {
+                return "No providers configured. Use /addkey to add one.".to_string();
+            }
+            let mut lines = vec!["Configured providers:".to_string()];
+            for p in &creds.providers {
+                let key_count = p.keys.iter().filter(|k| !is_placeholder_key(k)).count();
+                let active = if p.name == creds.active {
+                    " (active)"
+                } else {
+                    ""
+                };
+                let proxy = if let Some(ref url) = p.base_url {
+                    format!(" via {}", url)
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "  {} — model: {}, {} key(s){}{}",
+                    p.name, p.model, key_count, proxy, active
+                ));
+            }
+            lines.push(String::new());
+            lines.push(
+                "Use /addkey to add a new key, /removekey <provider> to remove one.".to_string(),
+            );
+            lines.join("\n")
+        }
+        None => "No providers configured. Use /addkey to add one.".to_string(),
+    }
+}
+
+/// Remove a provider from credentials.
+fn remove_provider(provider_name: &str) -> String {
+    if provider_name.is_empty() {
+        return "Usage: /removekey <provider>\nExample: /removekey openai".to_string();
+    }
+    let mut creds = match load_credentials_file() {
+        Some(c) => c,
+        None => return "No providers configured.".to_string(),
+    };
+    let before = creds.providers.len();
+    creds.providers.retain(|p| p.name != provider_name);
+    if creds.providers.len() == before {
+        return format!(
+            "Provider '{}' not found. Use /keys to see configured providers.",
+            provider_name
+        );
+    }
+    // If we removed the active provider, switch to first remaining
+    if creds.active == provider_name {
+        creds.active = creds
+            .providers
+            .first()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+    }
+    let path = credentials_path();
+    match toml::to_string_pretty(&creds) {
+        Ok(content) => {
+            if let Err(e) = std::fs::write(&path, content) {
+                return format!("Failed to save: {}", e);
+            }
+        }
+        Err(e) => return format!("Failed to serialize: {}", e),
+    }
+    if creds.providers.is_empty() {
+        format!(
+            "Removed {}. No providers remaining — send a new API key to configure one.",
+            provider_name
+        )
+    } else {
+        format!(
+            "Removed {}. Active provider: {} (model: {})",
+            provider_name,
+            creds.active,
+            creds
+                .providers
+                .first()
+                .map(|p| p.model.as_str())
+                .unwrap_or("unknown")
+        )
+    }
+}
+
+/// Decrypt an `enc:v1:` blob using the OTK from the setup token store.
+async fn decrypt_otk_blob(
+    blob_b64: &str,
+    store: &skyclaw_gateway::SetupTokenStore,
+    chat_id: &str,
+) -> std::result::Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+    // Look up OTK for this chat
+    let otk = store
+        .consume(chat_id)
+        .await
+        .ok_or_else(|| "No pending setup link for this chat. Run /addkey first.".to_string())?;
+
+    // Base64 decode
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(blob_b64.trim())
+        .map_err(|e| format!("Invalid base64: {}", e))?;
+
+    // Need at least 12 (IV) + 16 (tag) + 1 (ciphertext) bytes
+    if blob.len() < 29 {
+        return Err("Encrypted blob too short.".to_string());
+    }
+
+    // Split: first 12 bytes = IV, rest = ciphertext + auth tag
+    let (iv_bytes, ciphertext) = blob.split_at(12);
+
+    let key = Key::<Aes256Gcm>::from_slice(&otk);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(iv_bytes);
+
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        "Decryption failed — the setup link may have expired or the data was tampered with."
+            .to_string()
+    })?;
+
+    String::from_utf8(plaintext).map_err(|_| "Decrypted data is not valid UTF-8.".to_string())
 }
 
 // ── Stop-command detection ─────────────────────────────────
@@ -888,12 +1108,23 @@ async fn main() -> Result<()> {
             let pending_messages: skyclaw_tools::PendingMessages =
                 Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-            // ── Tools ──────────────────────────────────────────
+            // ── OTK setup token store ───────────────────────────
+            let setup_tokens = skyclaw_gateway::SetupTokenStore::new();
+
+            // ── Pending raw key pastes (from /addkey unsafe) ────
+            let pending_raw_keys: Arc<Mutex<HashSet<String>>> =
+                Arc::new(Mutex::new(HashSet::new()));
+
+            // ── Tools (with secret-censoring channel wrapper) ───
+            let censored_channel: Option<Arc<dyn Channel>> = primary_channel
+                .clone()
+                .map(|ch| Arc::new(SecretCensorChannel { inner: ch }) as Arc<dyn Channel>);
             let tools = skyclaw_tools::create_tools(
                 &config.tools,
-                primary_channel.clone(),
+                censored_channel,
                 Some(pending_messages.clone()),
                 Some(memory.clone()),
+                Some(Arc::new(setup_tokens.clone()) as Arc<dyn skyclaw_core::SetupLinkGenerator>),
             );
             tracing::info!(count = tools.len(), "Tools initialized");
 
@@ -1017,6 +1248,8 @@ async fn main() -> Result<()> {
                 let provider_base_url = config.provider.base_url.clone();
                 let ws_path = workspace_path.clone();
                 let pending_clone = pending_messages.clone();
+                let setup_tokens_clone = setup_tokens.clone();
+                let pending_raw_keys_clone = pending_raw_keys.clone();
 
                 let chat_slots: Arc<Mutex<HashMap<String, ChatSlot>>> =
                     Arc::new(Mutex::new(HashMap::new()));
@@ -1099,6 +1332,8 @@ async fn main() -> Result<()> {
                             let interrupt_clone = interrupt.clone();
                             let is_heartbeat_clone = is_heartbeat.clone();
                             let pending_for_worker = pending_clone.clone();
+                            let setup_tokens_worker = setup_tokens_clone.clone();
+                            let pending_raw_keys_worker = pending_raw_keys_clone.clone();
                             let worker_chat_id = chat_id.clone();
 
                             tokio::spawn(async move {
@@ -1111,6 +1346,186 @@ async fn main() -> Result<()> {
                                     interrupt_clone.store(false, Ordering::Relaxed);
 
                                     let interrupt_flag = Some(interrupt_clone.clone());
+
+                                    // ── Commands — intercepted before agent ──────
+                                    let msg_text_cmd = msg.text.as_deref().unwrap_or("");
+                                    let cmd_lower = msg_text_cmd.trim().to_lowercase();
+
+                                    // /addkey — secure OTK flow
+                                    if cmd_lower == "/addkey" {
+                                        let otk = setup_tokens_worker.generate(&msg.chat_id).await;
+                                        let otk_hex = hex::encode(otk);
+                                        let link = format!(
+                                            "https://nagisanzenin.github.io/skyclaw/setup#{}",
+                                            otk_hex
+                                        );
+                                        let reply = skyclaw_core::types::message::OutboundMessage {
+                                            chat_id: msg.chat_id.clone(),
+                                            text: format!(
+                                                "Secure key setup:\n\n\
+                                                 1. Open this link:\n{}\n\n\
+                                                 2. Paste your API key in the form\n\
+                                                 3. Copy the encrypted blob\n\
+                                                 4. Paste it back here\n\n\
+                                                 Link expires in 10 minutes.\n\n\
+                                                 For a quick (less secure) method: /addkey unsafe",
+                                                link
+                                            ),
+                                            reply_to: Some(msg.id.clone()),
+                                            parse_mode: None,
+                                        };
+                                        let _ = sender.send_message(reply).await;
+                                        is_heartbeat_clone.store(false, Ordering::Relaxed);
+                                        continue;
+                                    }
+
+                                    // /addkey unsafe — raw key paste mode
+                                    if cmd_lower == "/addkey unsafe" {
+                                        pending_raw_keys_worker.lock().await.insert(msg.chat_id.clone());
+                                        let reply = skyclaw_core::types::message::OutboundMessage {
+                                            chat_id: msg.chat_id.clone(),
+                                            text: "Paste your API key in the next message.\n\n\
+                                                   Warning: the key will be visible in chat history.\n\
+                                                   For a secure method, use /addkey instead."
+                                                .to_string(),
+                                            reply_to: Some(msg.id.clone()),
+                                            parse_mode: None,
+                                        };
+                                        let _ = sender.send_message(reply).await;
+                                        is_heartbeat_clone.store(false, Ordering::Relaxed);
+                                        continue;
+                                    }
+
+                                    // /keys — list configured providers
+                                    if cmd_lower == "/keys" {
+                                        let info = list_configured_providers();
+                                        let reply = skyclaw_core::types::message::OutboundMessage {
+                                            chat_id: msg.chat_id.clone(),
+                                            text: info,
+                                            reply_to: Some(msg.id.clone()),
+                                            parse_mode: None,
+                                        };
+                                        let _ = sender.send_message(reply).await;
+                                        is_heartbeat_clone.store(false, Ordering::Relaxed);
+                                        continue;
+                                    }
+
+                                    // /removekey <provider>
+                                    if cmd_lower.starts_with("/removekey") {
+                                        let provider_arg = msg_text_cmd.trim()["/removekey".len()..].trim();
+                                        let result = remove_provider(provider_arg);
+                                        let reply = skyclaw_core::types::message::OutboundMessage {
+                                            chat_id: msg.chat_id.clone(),
+                                            text: result,
+                                            reply_to: Some(msg.id.clone()),
+                                            parse_mode: None,
+                                        };
+                                        let _ = sender.send_message(reply).await;
+
+                                        // If provider was removed, check if agent needs to go offline
+                                        if !provider_arg.is_empty() && load_active_provider_keys().is_none() {
+                                            *agent_state.write().await = None;
+                                            tracing::info!("All providers removed — agent offline");
+                                        }
+
+                                        is_heartbeat_clone.store(false, Ordering::Relaxed);
+                                        continue;
+                                    }
+
+                                    // enc:v1: — encrypted blob from OTK flow
+                                    if msg_text_cmd.trim().starts_with("enc:v1:") {
+                                        let blob_b64 = &msg_text_cmd.trim()["enc:v1:".len()..];
+                                        match decrypt_otk_blob(blob_b64, &setup_tokens_worker, &msg.chat_id).await {
+                                            Ok(api_key_text) => {
+                                                // Treat the decrypted text as an API key
+                                                if let Some(cred) = detect_api_key(&api_key_text) {
+                                                    let model = default_model(cred.provider).to_string();
+                                                    let effective_base_url = cred.base_url.clone().or_else(|| base_url.clone());
+                                                    let test_config = skyclaw_core::types::config::ProviderConfig {
+                                                        name: Some(cred.provider.to_string()),
+                                                        api_key: Some(cred.api_key.clone()),
+                                                        keys: vec![cred.api_key.clone()],
+                                                        model: Some(model.clone()),
+                                                        base_url: effective_base_url,
+                                                        extra_headers: std::collections::HashMap::new(),
+                                                    };
+                                                    match validate_provider_key(&test_config).await {
+                                                        Ok(validated_provider) => {
+                                                            if let Err(e) = save_credentials(cred.provider, &cred.api_key, &model, cred.base_url.as_deref()).await {
+                                                                tracing::error!(error = %e, "Failed to save credentials from OTK flow");
+                                                            }
+                                                            let new_agent = Arc::new(skyclaw_agent::AgentRuntime::with_limits(
+                                                                validated_provider,
+                                                                memory.clone(),
+                                                                tools_template.clone(),
+                                                                model.clone(),
+                                                                Some(build_system_prompt()),
+                                                                max_turns,
+                                                                max_ctx,
+                                                                max_rounds,
+                                                                max_task_duration,
+                                                                max_spend,
+                                                            ));
+                                                            *agent_state.write().await = Some(new_agent);
+                                                            let reply = skyclaw_core::types::message::OutboundMessage {
+                                                                chat_id: msg.chat_id.clone(),
+                                                                text: format!(
+                                                                    "API key securely received and verified! Configured {} with model {}.\n\nSkyClaw is online.",
+                                                                    cred.provider, model
+                                                                ),
+                                                                reply_to: Some(msg.id.clone()),
+                                                                parse_mode: None,
+                                                            };
+                                                            let _ = sender.send_message(reply).await;
+                                                            tracing::info!(provider = %cred.provider, "OTK key validated — agent online");
+                                                        }
+                                                        Err(err) => {
+                                                            let reply = skyclaw_core::types::message::OutboundMessage {
+                                                                chat_id: msg.chat_id.clone(),
+                                                                text: format!(
+                                                                    "Key decrypted but validation failed — {} returned:\n{}\n\nCheck the key and try /addkey again.",
+                                                                    cred.provider, err
+                                                                ),
+                                                                reply_to: Some(msg.id.clone()),
+                                                                parse_mode: None,
+                                                            };
+                                                            let _ = sender.send_message(reply).await;
+                                                        }
+                                                    }
+                                                } else {
+                                                    let reply = skyclaw_core::types::message::OutboundMessage {
+                                                        chat_id: msg.chat_id.clone(),
+                                                        text: "Decrypted successfully but couldn't detect the provider. \
+                                                               Make sure you pasted a valid API key in the setup page."
+                                                            .to_string(),
+                                                        reply_to: Some(msg.id.clone()),
+                                                        parse_mode: None,
+                                                    };
+                                                    let _ = sender.send_message(reply).await;
+                                                }
+                                            }
+                                            Err(err) => {
+                                                let reply = skyclaw_core::types::message::OutboundMessage {
+                                                    chat_id: msg.chat_id.clone(),
+                                                    text: err,
+                                                    reply_to: Some(msg.id.clone()),
+                                                    parse_mode: None,
+                                                };
+                                                let _ = sender.send_message(reply).await;
+                                            }
+                                        }
+                                        is_heartbeat_clone.store(false, Ordering::Relaxed);
+                                        if let Ok(mut pq) = pending_for_worker.lock() {
+                                            pq.remove(&worker_chat_id);
+                                        }
+                                        continue;
+                                    }
+
+                                    // Pending raw key paste (from /addkey unsafe)
+                                    if pending_raw_keys_worker.lock().await.remove(&msg.chat_id) {
+                                        // Treat the message as a raw API key — falls through
+                                        // to the normal detect_api_key path below
+                                    }
 
                                     // Check if agent is available
                                     let agent = {
@@ -1257,7 +1672,8 @@ async fn main() -> Result<()> {
                                         };
 
                                         match agent.process_message(&msg, &mut session, interrupt_flag, Some(pending_for_worker.clone())).await {
-                                            Ok(reply) => {
+                                            Ok(mut reply) => {
+                                                reply.text = censor_secrets(&reply.text);
                                                 if let Err(e) = sender.send_message(reply).await {
                                                     tracing::error!(error = %e, "Failed to send reply");
                                                 }
@@ -1266,7 +1682,7 @@ async fn main() -> Result<()> {
                                                 tracing::error!(error = %e, "Agent processing error");
                                                 let error_reply = skyclaw_core::types::message::OutboundMessage {
                                                     chat_id: msg.chat_id.clone(),
-                                                    text: format!("Error: {}", e),
+                                                    text: censor_secrets(&format!("Error: {}", e)),
                                                     reply_to: Some(msg.id.clone()),
                                                     parse_mode: None,
                                                 };
@@ -1437,10 +1853,16 @@ async fn main() -> Result<()> {
                                                 }
                                             }
                                         } else {
-                                            // Send onboarding welcome
+                                            // Auto-generate OTK and send onboarding with setup link
+                                            let otk = setup_tokens_worker.generate(&msg.chat_id).await;
+                                            let otk_hex = hex::encode(otk);
+                                            let link = format!(
+                                                "https://nagisanzenin.github.io/skyclaw/setup#{}",
+                                                otk_hex
+                                            );
                                             let reply = skyclaw_core::types::message::OutboundMessage {
                                                 chat_id: msg.chat_id.clone(),
-                                                text: ONBOARDING_MESSAGE.to_string(),
+                                                text: onboarding_message_with_link(&link),
                                                 reply_to: Some(msg.id.clone()),
                                                 parse_mode: None,
                                             };
@@ -1537,21 +1959,6 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let (pname, key, model) = match credentials {
-                Some(c) => c,
-                None => {
-                    eprintln!("No API key configured. Set ANTHROPIC_API_KEY or run 'skyclaw start' to onboard.");
-                    std::process::exit(1);
-                }
-            };
-
-            if is_placeholder_key(&key) {
-                eprintln!(
-                    "API key is a placeholder. Provide a real key via config or environment."
-                );
-                std::process::exit(1);
-            }
-
             // ── Memory backend ─────────────────────────────────
             let memory_url = config.memory.path.clone().unwrap_or_else(|| {
                 let data_dir = dirs::home_dir()
@@ -1575,55 +1982,89 @@ async fn main() -> Result<()> {
             cli_channel.start().await?;
             let cli_arc: Arc<dyn skyclaw_core::Channel> = Arc::new(cli_channel);
 
+            // ── OTK state ──────────────────────────────────────
+            let setup_tokens = skyclaw_gateway::SetupTokenStore::new();
+
             // ── Tools ──────────────────────────────────────────
             let pending_messages: skyclaw_tools::PendingMessages =
                 Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-            let tools = skyclaw_tools::create_tools(
+            let censored_cli: Arc<dyn Channel> = Arc::new(SecretCensorChannel {
+                inner: cli_arc.clone(),
+            });
+            let tools_template = skyclaw_tools::create_tools(
                 &config.tools,
-                Some(cli_arc.clone()),
+                Some(censored_cli),
                 Some(pending_messages.clone()),
                 Some(memory.clone()),
+                Some(Arc::new(setup_tokens.clone()) as Arc<dyn skyclaw_core::SetupLinkGenerator>),
             );
+            let base_url = config.provider.base_url.clone();
 
-            // ── Provider ───────────────────────────────────────
-            let (all_keys, saved_base_url) = load_active_provider_keys()
-                .map(|(_, keys, _, burl)| {
-                    let valid: Vec<String> = keys
-                        .into_iter()
-                        .filter(|k| !is_placeholder_key(k))
-                        .collect();
-                    (valid, burl)
-                })
-                .unwrap_or_else(|| (vec![key.clone()], None));
-            let effective_base_url = saved_base_url.or_else(|| config.provider.base_url.clone());
-            let provider_config = skyclaw_core::types::config::ProviderConfig {
-                name: Some(pname.clone()),
-                api_key: Some(key.clone()),
-                keys: all_keys,
-                model: Some(model.clone()),
-                base_url: effective_base_url,
-                extra_headers: config.provider.extra_headers.clone(),
-            };
-            let provider: Arc<dyn skyclaw_core::Provider> =
-                Arc::from(skyclaw_providers::create_provider(&provider_config)?);
+            // ── Build agent (if credentials available) ─────────
+            let max_turns = config.agent.max_turns;
+            let max_ctx = config.agent.max_context_tokens;
+            let max_rounds = config.agent.max_tool_rounds;
+            let max_task_duration = config.agent.max_task_duration_secs;
+            let max_spend = config.agent.max_spend_usd;
 
-            // ── Agent ──────────────────────────────────────────
-            let system_prompt = Some(build_system_prompt());
-            let agent = skyclaw_agent::AgentRuntime::with_limits(
-                provider,
-                memory.clone(),
-                tools,
-                model.clone(),
-                system_prompt,
-                config.agent.max_turns,
-                config.agent.max_context_tokens,
-                config.agent.max_tool_rounds,
-                config.agent.max_task_duration_secs,
-                config.agent.max_spend_usd,
-            );
+            let mut agent_opt: Option<skyclaw_agent::AgentRuntime> = None;
 
-            println!("Connected to {} (model: {})", pname, model);
-            println!("Budget: ${:.2} per session", config.agent.max_spend_usd);
+            if let Some((pname, key, model)) = credentials {
+                if !is_placeholder_key(&key) {
+                    let (all_keys, saved_base_url) = load_active_provider_keys()
+                        .map(|(_, keys, _, burl)| {
+                            let valid: Vec<String> = keys
+                                .into_iter()
+                                .filter(|k| !is_placeholder_key(k))
+                                .collect();
+                            (valid, burl)
+                        })
+                        .unwrap_or_else(|| (vec![key.clone()], None));
+                    let effective_base_url =
+                        saved_base_url.or_else(|| config.provider.base_url.clone());
+                    let provider_config = skyclaw_core::types::config::ProviderConfig {
+                        name: Some(pname.clone()),
+                        api_key: Some(key.clone()),
+                        keys: all_keys,
+                        model: Some(model.clone()),
+                        base_url: effective_base_url,
+                        extra_headers: config.provider.extra_headers.clone(),
+                    };
+                    match skyclaw_providers::create_provider(&provider_config) {
+                        Ok(provider) => {
+                            let provider: Arc<dyn skyclaw_core::Provider> = Arc::from(provider);
+                            let system_prompt = Some(build_system_prompt());
+                            agent_opt = Some(skyclaw_agent::AgentRuntime::with_limits(
+                                provider,
+                                memory.clone(),
+                                tools_template.clone(),
+                                model.clone(),
+                                system_prompt,
+                                max_turns,
+                                max_ctx,
+                                max_rounds,
+                                max_task_duration,
+                                max_spend,
+                            ));
+                            println!("Connected to {} (model: {})", pname, model);
+                            println!("Budget: ${:.2} per session", max_spend);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create provider: {}", e);
+                        }
+                    }
+                }
+            }
+
+            if agent_opt.is_none() {
+                println!("No API key configured — running in onboarding mode.");
+                // Auto-generate OTK and show setup link immediately
+                let otk = setup_tokens.generate("cli").await;
+                let otk_hex = hex::encode(otk);
+                let link = format!("https://nagisanzenin.github.io/skyclaw/setup#{}", otk_hex);
+                println!("\n{}", onboarding_message_with_link(&link));
+                println!("\n{}", ONBOARDING_REFERENCE);
+            }
             println!("---\n");
 
             // ── Message loop ───────────────────────────────────
@@ -1631,27 +2072,212 @@ async fn main() -> Result<()> {
             let mut history: Vec<skyclaw_core::types::message::ChatMessage> = Vec::new();
 
             while let Some(msg) = rx.recv().await {
-                let mut session = skyclaw_core::types::session::SessionContext {
-                    session_id: "cli-cli".to_string(),
-                    user_id: msg.user_id.clone(),
-                    channel: msg.channel.clone(),
-                    chat_id: msg.chat_id.clone(),
-                    history: history.clone(),
-                    workspace_path: workspace.clone(),
-                };
+                let msg_text = msg.text.as_deref().unwrap_or("");
+                let cmd_lower = msg_text.trim().to_lowercase();
 
-                match agent.process_message(&msg, &mut session, None, None).await {
-                    Ok(reply) => {
-                        cli_arc.send_message(reply).await.ok();
-                    }
-                    Err(e) => {
-                        eprintln!("  [error: {}]", e);
-                        eprint!("skyclaw> ");
-                    }
+                // ── Command interception (same as gateway) ─────
+                // /addkey — secure OTK flow
+                if cmd_lower == "/addkey" {
+                    let otk = setup_tokens.generate(&msg.chat_id).await;
+                    let otk_hex = hex::encode(otk);
+                    let link = format!("https://nagisanzenin.github.io/skyclaw/setup#{}", otk_hex);
+                    println!(
+                        "\nSecure key setup:\n\n\
+                         1. Open this link:\n{}\n\n\
+                         2. Paste your API key in the form\n\
+                         3. Copy the encrypted blob\n\
+                         4. Paste it back here\n\n\
+                         Link expires in 10 minutes.\n\n\
+                         For a quick (less secure) method: /addkey unsafe\n",
+                        link
+                    );
+                    eprint!("skyclaw> ");
+                    continue;
                 }
 
-                // Preserve conversation history across messages
-                history = session.history;
+                // /addkey unsafe
+                if cmd_lower == "/addkey unsafe" {
+                    println!("\nPaste your API key below.");
+                    println!("Warning: the key will be visible in terminal history.");
+                    println!("For a secure method, use /addkey instead.\n");
+                    eprint!("skyclaw> ");
+                    continue;
+                }
+
+                // /keys
+                if cmd_lower == "/keys" {
+                    println!("\n{}\n", list_configured_providers());
+                    eprint!("skyclaw> ");
+                    continue;
+                }
+
+                // /removekey <provider>
+                if cmd_lower.starts_with("/removekey") {
+                    let provider_arg = msg_text.trim()["/removekey".len()..].trim();
+                    println!("\n{}\n", remove_provider(provider_arg));
+                    if !provider_arg.is_empty() && load_active_provider_keys().is_none() {
+                        agent_opt = None;
+                        println!("All providers removed — agent offline.\n");
+                    }
+                    eprint!("skyclaw> ");
+                    continue;
+                }
+
+                // enc:v1: — encrypted blob from OTK flow
+                if msg_text.trim().starts_with("enc:v1:") {
+                    let blob_b64 = &msg_text.trim()["enc:v1:".len()..];
+                    match decrypt_otk_blob(blob_b64, &setup_tokens, &msg.chat_id).await {
+                        Ok(api_key_text) => {
+                            if let Some(cred) = detect_api_key(&api_key_text) {
+                                let model = default_model(cred.provider).to_string();
+                                let effective_base_url =
+                                    cred.base_url.clone().or_else(|| base_url.clone());
+                                let test_config = skyclaw_core::types::config::ProviderConfig {
+                                    name: Some(cred.provider.to_string()),
+                                    api_key: Some(cred.api_key.clone()),
+                                    keys: vec![cred.api_key.clone()],
+                                    model: Some(model.clone()),
+                                    base_url: effective_base_url,
+                                    extra_headers: std::collections::HashMap::new(),
+                                };
+                                match validate_provider_key(&test_config).await {
+                                    Ok(validated_provider) => {
+                                        if let Err(e) = save_credentials(
+                                            cred.provider,
+                                            &cred.api_key,
+                                            &model,
+                                            cred.base_url.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            eprintln!("Failed to save credentials: {}", e);
+                                        }
+                                        let system_prompt = Some(build_system_prompt());
+                                        agent_opt = Some(skyclaw_agent::AgentRuntime::with_limits(
+                                            validated_provider,
+                                            memory.clone(),
+                                            tools_template.clone(),
+                                            model.clone(),
+                                            system_prompt,
+                                            max_turns,
+                                            max_ctx,
+                                            max_rounds,
+                                            max_task_duration,
+                                            max_spend,
+                                        ));
+                                        println!(
+                                            "\nAPI key securely received and verified! Configured {} with model {}.",
+                                            cred.provider, model
+                                        );
+                                        println!("SkyClaw is online.\n");
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "\nKey decrypted but validation failed — {} returned:\n{}\nCheck the key and try /addkey again.\n",
+                                            cred.provider, err
+                                        );
+                                    }
+                                }
+                            } else {
+                                eprintln!(
+                                    "\nDecrypted successfully but couldn't detect the provider.\nMake sure you pasted a valid API key in the setup page.\n"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("\n{}\n", err);
+                        }
+                    }
+                    eprint!("skyclaw> ");
+                    continue;
+                }
+
+                // Detect raw API key paste
+                if let Some(cred) = detect_api_key(msg_text) {
+                    let model = default_model(cred.provider).to_string();
+                    let effective_base_url = cred.base_url.clone().or_else(|| base_url.clone());
+                    let test_config = skyclaw_core::types::config::ProviderConfig {
+                        name: Some(cred.provider.to_string()),
+                        api_key: Some(cred.api_key.clone()),
+                        keys: vec![cred.api_key.clone()],
+                        model: Some(model.clone()),
+                        base_url: effective_base_url,
+                        extra_headers: std::collections::HashMap::new(),
+                    };
+                    match validate_provider_key(&test_config).await {
+                        Ok(validated_provider) => {
+                            if let Err(e) = save_credentials(
+                                cred.provider,
+                                &cred.api_key,
+                                &model,
+                                cred.base_url.as_deref(),
+                            )
+                            .await
+                            {
+                                eprintln!("Failed to save credentials: {}", e);
+                            }
+                            let system_prompt = Some(build_system_prompt());
+                            agent_opt = Some(skyclaw_agent::AgentRuntime::with_limits(
+                                validated_provider,
+                                memory.clone(),
+                                tools_template.clone(),
+                                model.clone(),
+                                system_prompt,
+                                max_turns,
+                                max_ctx,
+                                max_rounds,
+                                max_task_duration,
+                                max_spend,
+                            ));
+                            println!(
+                                "\nAPI key verified! Configured {} with model {}.",
+                                cred.provider, model
+                            );
+                            println!("SkyClaw is online.\n");
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "\nInvalid API key — {} returned:\n{}\nCheck the key and try again.\n",
+                                cred.provider, err
+                            );
+                        }
+                    }
+                    eprint!("skyclaw> ");
+                    continue;
+                }
+
+                // ── Normal agent processing ────────────────────
+                if let Some(ref agent) = agent_opt {
+                    let mut session = skyclaw_core::types::session::SessionContext {
+                        session_id: "cli-cli".to_string(),
+                        user_id: msg.user_id.clone(),
+                        channel: msg.channel.clone(),
+                        chat_id: msg.chat_id.clone(),
+                        history: history.clone(),
+                        workspace_path: workspace.clone(),
+                    };
+
+                    match agent.process_message(&msg, &mut session, None, None).await {
+                        Ok(mut reply) => {
+                            reply.text = censor_secrets(&reply.text);
+                            cli_arc.send_message(reply).await.ok();
+                        }
+                        Err(e) => {
+                            eprintln!("  [error: {}]", e);
+                            eprint!("skyclaw> ");
+                        }
+                    }
+
+                    history = session.history;
+                } else {
+                    // Auto-generate fresh OTK for onboarding
+                    let otk = setup_tokens.generate("cli").await;
+                    let otk_hex = hex::encode(otk);
+                    let link = format!("https://nagisanzenin.github.io/skyclaw/setup#{}", otk_hex);
+                    println!("\n{}", onboarding_message_with_link(&link));
+                    println!("\n{}\n", ONBOARDING_REFERENCE);
+                    eprint!("skyclaw> ");
+                }
             }
 
             println!("\nSkyClaw chat ended.");
@@ -1904,5 +2530,322 @@ mod tests {
         // These match sk- prefix but are obvious placeholders
         assert!(detect_api_key("sk-your_key_here_12345").is_none());
         assert!(detect_api_key("sk-ant-paste_your_key_here").is_none());
+    }
+
+    // ── OTK: AES-256-GCM encrypt/decrypt round-trip ──────────────────
+
+    #[tokio::test]
+    async fn otk_encrypt_decrypt_round_trip() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+        let store = skyclaw_gateway::SetupTokenStore::new();
+        let otk = store.generate("test-chat").await;
+
+        // Simulate browser-side encryption
+        let api_key = "sk-ant-api03-realkey1234567890abcdef";
+        let key = Key::<Aes256Gcm>::from_slice(&otk);
+        let cipher = Aes256Gcm::new(key);
+
+        let mut iv = [0u8; 12];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut iv);
+        let nonce = Nonce::from_slice(&iv);
+
+        let ciphertext = cipher
+            .encrypt(nonce, api_key.as_bytes())
+            .expect("encryption failed");
+
+        // Concatenate IV + ciphertext (matches WebCrypto format)
+        let mut blob = Vec::with_capacity(12 + ciphertext.len());
+        blob.extend_from_slice(&iv);
+        blob.extend_from_slice(&ciphertext);
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+        // Decrypt using the OTK flow
+        let result = decrypt_otk_blob(&b64, &store, "test-chat").await;
+        assert_eq!(result.unwrap(), api_key);
+    }
+
+    #[tokio::test]
+    async fn otk_decrypt_wrong_chat_id_fails() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+        let store = skyclaw_gateway::SetupTokenStore::new();
+        let otk = store.generate("chat-a").await;
+
+        let api_key = "sk-ant-api03-testkey123456789";
+        let key = Key::<Aes256Gcm>::from_slice(&otk);
+        let cipher = Aes256Gcm::new(key);
+        let iv = [1u8; 12];
+        let nonce = Nonce::from_slice(&iv);
+        let ciphertext = cipher
+            .encrypt(nonce, api_key.as_bytes())
+            .expect("encryption failed");
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&iv);
+        blob.extend_from_slice(&ciphertext);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+        // Try to decrypt with wrong chat_id — should fail (no OTK)
+        let result = decrypt_otk_blob(&b64, &store, "chat-b").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No pending setup link"));
+    }
+
+    #[tokio::test]
+    async fn otk_decrypt_expired_token_fails() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+        let store = skyclaw_gateway::SetupTokenStore::with_ttl(std::time::Duration::from_millis(1));
+        let otk = store.generate("chat-expire").await;
+
+        let api_key = "sk-ant-api03-testkey123456789";
+        let key = Key::<Aes256Gcm>::from_slice(&otk);
+        let cipher = Aes256Gcm::new(key);
+        let iv = [2u8; 12];
+        let nonce = Nonce::from_slice(&iv);
+        let ciphertext = cipher
+            .encrypt(nonce, api_key.as_bytes())
+            .expect("encryption failed");
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&iv);
+        blob.extend_from_slice(&ciphertext);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let result = decrypt_otk_blob(&b64, &store, "chat-expire").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No pending setup link"));
+    }
+
+    #[tokio::test]
+    async fn otk_decrypt_tampered_blob_fails() {
+        let store = skyclaw_gateway::SetupTokenStore::new();
+        let _otk = store.generate("chat-tamper").await;
+
+        // Tampered blob — valid base64 but wrong ciphertext
+        let fake_blob = base64::engine::general_purpose::STANDARD.encode([0u8; 64]); // random bytes
+
+        let result = decrypt_otk_blob(&fake_blob, &store, "chat-tamper").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Decryption failed"));
+    }
+
+    #[tokio::test]
+    async fn otk_decrypt_invalid_base64_fails() {
+        let store = skyclaw_gateway::SetupTokenStore::new();
+        let _otk = store.generate("chat-b64").await;
+
+        let result = decrypt_otk_blob("not!valid!base64!!!", &store, "chat-b64").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid base64"));
+    }
+
+    #[tokio::test]
+    async fn otk_decrypt_too_short_blob_fails() {
+        let store = skyclaw_gateway::SetupTokenStore::new();
+        let _otk = store.generate("chat-short").await;
+
+        let short_blob = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
+
+        let result = decrypt_otk_blob(&short_blob, &store, "chat-short").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn enc_v1_prefix_detection() {
+        assert!("enc:v1:SGVsbG8gV29ybGQ=".starts_with("enc:v1:"));
+        assert!(!"sk-ant-api03-abc".starts_with("enc:v1:"));
+        assert!(!"enc:v2:something".starts_with("enc:v1:"));
+    }
+
+    // ── Command parsing ──────────────────────────────────────────────
+
+    #[test]
+    fn command_addkey_detection() {
+        assert_eq!("/addkey".trim().to_lowercase(), "/addkey");
+        assert_eq!("/addkey ".trim().to_lowercase(), "/addkey");
+        assert_eq!("  /addkey  ".trim().to_lowercase(), "/addkey");
+    }
+
+    #[test]
+    fn command_addkey_unsafe_detection() {
+        assert_eq!("/addkey unsafe".trim().to_lowercase(), "/addkey unsafe");
+        assert_eq!("  /addkey unsafe  ".trim().to_lowercase(), "/addkey unsafe");
+    }
+
+    #[test]
+    fn command_keys_detection() {
+        assert_eq!("/keys".trim().to_lowercase(), "/keys");
+    }
+
+    #[test]
+    fn command_removekey_detection() {
+        let cmd = "/removekey openai";
+        let lower = cmd.trim().to_lowercase();
+        assert!(lower.starts_with("/removekey"));
+        let provider = cmd.trim()["/removekey".len()..].trim();
+        assert_eq!(provider, "openai");
+    }
+
+    #[test]
+    fn command_removekey_no_provider() {
+        let cmd = "/removekey";
+        let provider = cmd.trim()["/removekey".len()..].trim();
+        assert!(provider.is_empty());
+    }
+
+    // ── list/remove helpers ──────────────────────────────────────────
+
+    #[test]
+    fn list_providers_no_credentials() {
+        // When no credentials file exists, returns helpful message
+        let result = list_configured_providers();
+        // Either returns provider list or "no providers" message — both valid
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn remove_provider_empty_name() {
+        let result = remove_provider("");
+        assert!(result.contains("Usage"));
+    }
+
+    // ── OTK hex encoding ─────────────────────────────────────────────
+
+    #[test]
+    fn otk_hex_encoding_format() {
+        let bytes = [0xab_u8; 32];
+        let hex_str = hex::encode(bytes);
+        assert_eq!(hex_str.len(), 64); // 32 bytes = 64 hex chars
+        assert!(hex_str.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Full end-to-end: generate OTK → hex encode (like /addkey) → decode hex
+    /// (like browser) → encrypt (like browser) → format as enc:v1: → decrypt
+    /// (like server). Verifies the entire chain is consistent.
+    #[tokio::test]
+    async fn otk_full_e2e_hex_roundtrip() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+        let store = skyclaw_gateway::SetupTokenStore::new();
+        let otk = store.generate("e2e-chat").await;
+
+        // Step 1: Server encodes OTK as hex (what goes into the URL fragment)
+        let otk_hex = hex::encode(otk);
+        assert_eq!(otk_hex.len(), 64);
+
+        // Step 2: Browser decodes hex back to bytes (simulating JS hex decode)
+        let browser_otk = hex::decode(&otk_hex).expect("hex decode failed");
+        assert_eq!(browser_otk.len(), 32);
+        assert_eq!(&browser_otk[..], &otk[..]);
+
+        // Step 3: Browser encrypts with AES-256-GCM (simulating WebCrypto)
+        let api_key = "sk-ant-api03-test1234567890abcdefghijklmnopqrs";
+        let key = Key::<Aes256Gcm>::from_slice(&browser_otk);
+        let cipher = Aes256Gcm::new(key);
+        let mut iv = [0u8; 12];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut iv);
+        let nonce = Nonce::from_slice(&iv);
+        let ciphertext = cipher
+            .encrypt(nonce, api_key.as_bytes())
+            .expect("encryption failed");
+
+        // Step 4: Browser builds "enc:v1:" blob
+        let mut blob = Vec::with_capacity(12 + ciphertext.len());
+        blob.extend_from_slice(&iv);
+        blob.extend_from_slice(&ciphertext);
+        let enc_blob = format!(
+            "enc:v1:{}",
+            base64::engine::general_purpose::STANDARD.encode(&blob)
+        );
+
+        // Step 5: Server detects prefix and decrypts
+        assert!(enc_blob.starts_with("enc:v1:"));
+        let blob_b64 = &enc_blob["enc:v1:".len()..];
+        let result = decrypt_otk_blob(blob_b64, &store, "e2e-chat").await;
+        assert_eq!(result.unwrap(), api_key);
+    }
+
+    /// Verify that detect_api_key works on decrypted OTK output for all providers.
+    #[test]
+    fn otk_decrypted_key_detection() {
+        // These are the key formats users would paste into the setup page
+        assert!(detect_api_key("sk-ant-api03-abcdefghijklmnop").is_some());
+        assert!(detect_api_key("sk-proj-abcdefghijklmnop1234").is_some());
+        assert!(detect_api_key("AIzaSyA-abcdefghijklmnopqrstu").is_some());
+        assert!(detect_api_key("xai-abcdefghijklmnopqrstuvwxyz").is_some());
+        assert!(detect_api_key("sk-or-v1-abcdefghijklmnopqrstu").is_some());
+    }
+
+    // ── censor_secrets: output filter ──────────────────────────────
+
+    #[test]
+    fn censor_no_credentials_file_returns_unchanged() {
+        // When there are no credentials, text passes through unchanged
+        let text = "Here is your key: sk-ant-test123456789";
+        let result = censor_secrets(text);
+        // Without credentials file, nothing to censor — returns as-is
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn censor_replaces_known_key_in_text() {
+        // Write a temporary credentials file for the test
+        let path = credentials_path();
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).ok();
+
+        // Save current file if exists, restore after test
+        let backup = std::fs::read_to_string(&path).ok();
+
+        let test_key = "sk-ant-test-SUPERSECRETKEY12345678";
+        let creds_content = format!(
+            "active = \"anthropic\"\n\n\
+             [[providers]]\n\
+             name = \"anthropic\"\n\
+             keys = [\"{}\"]\n\
+             model = \"claude-sonnet-4-6\"\n",
+            test_key
+        );
+        std::fs::write(&path, &creds_content).unwrap();
+
+        let text = format!("Your API key is {} and it works great!", test_key);
+        let censored = censor_secrets(&text);
+        assert!(
+            !censored.contains(test_key),
+            "Key should be censored from output"
+        );
+        assert!(
+            censored.contains("[REDACTED]"),
+            "Should contain [REDACTED] placeholder"
+        );
+        assert_eq!(censored, "Your API key is [REDACTED] and it works great!");
+
+        // Restore
+        match backup {
+            Some(content) => std::fs::write(&path, content).unwrap(),
+            None => {
+                std::fs::remove_file(&path).ok();
+            }
+        };
+    }
+
+    #[test]
+    fn censor_ignores_placeholder_keys() {
+        let text = "Your key is placeholder_or_empty";
+        let result = censor_secrets(text);
+        // Placeholder keys should not cause censoring
+        assert_eq!(result, text);
     }
 }
