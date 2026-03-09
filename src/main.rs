@@ -394,7 +394,7 @@ fn default_model(provider_name: &str) -> &'static str {
     match provider_name {
         "anthropic" => "claude-sonnet-4-6",
         "openai" => "gpt-5.2",
-        "gemini" => "gemini-2.5-flash",
+        "gemini" => "gemini-3-flash-preview",
         "grok" | "xai" => "grok-4-1-fast-non-reasoning",
         "openrouter" => "anthropic/claude-sonnet-4-6",
         "minimax" => "MiniMax-M2.5",
@@ -660,7 +660,7 @@ fn build_system_prompt() -> String {
     prompt.push_str("\n\nSUPPORTED PROVIDERS & DEFAULT MODELS:\n");
     prompt.push_str("- anthropic: claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-6\n");
     prompt.push_str("- openai: gpt-5.2, gpt-4.1, gpt-4.1-mini, o4-mini\n");
-    prompt.push_str("- gemini: gemini-2.5-flash, gemini-2.5-pro\n");
+    prompt.push_str("- gemini: gemini-3-flash-preview, gemini-3.1-pro-preview, gemini-2.5-flash, gemini-2.5-pro\n");
     prompt.push_str("- grok (xai): grok-4-1-fast-non-reasoning, grok-3\n");
     prompt.push_str(
         "- openrouter: any model via anthropic/claude-sonnet-4-6, openai/gpt-5.2, etc.\n",
@@ -2901,7 +2901,7 @@ mod tests {
     fn default_models_all_providers() {
         assert_eq!(default_model("anthropic"), "claude-sonnet-4-6");
         assert_eq!(default_model("openai"), "gpt-5.2");
-        assert_eq!(default_model("gemini"), "gemini-2.5-flash");
+        assert_eq!(default_model("gemini"), "gemini-3-flash-preview");
         assert_eq!(default_model("grok"), "grok-4-1-fast-non-reasoning");
         assert_eq!(default_model("xai"), "grok-4-1-fast-non-reasoning");
         assert_eq!(default_model("openrouter"), "anthropic/claude-sonnet-4-6");

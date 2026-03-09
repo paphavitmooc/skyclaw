@@ -135,7 +135,7 @@ Paste any of these API keys in Telegram — SkyClaw detects the provider automat
 |------------|----------|---------------|
 | `sk-ant-*` | Anthropic | claude-sonnet-4-6 |
 | `sk-*` | OpenAI | gpt-5.2 |
-| `AIzaSy*` | Google Gemini | gemini-2.5-flash |
+| `AIzaSy*` | Google Gemini | gemini-3-flash-preview |
 | `xai-*` | xAI Grok | grok-4-1-fast-non-reasoning |
 | `sk-or-*` | OpenRouter | anthropic/claude-sonnet-4-6 |
 | *(config only)* | MiniMax | MiniMax-M2.5 |
