@@ -97,6 +97,7 @@ hex = "0.4"
 dirs = "6"
 pin-project-lite = "0.2"
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Internal crates
 skyclaw-core = { path = "crates/skyclaw-core" }
@@ -159,6 +160,7 @@ async-trait.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
+tokio-util.workspace = true
 
 [features]
 default = ["telegram", "browser", "mcp", "codex-oauth"]

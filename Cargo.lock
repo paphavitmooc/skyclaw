@@ -4129,6 +4129,7 @@ dependencies = [
  "skyclaw-tools",
  "skyclaw-vault",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -4151,6 +4152,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "uuid",
@@ -5077,6 +5079,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

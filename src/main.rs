@@ -1884,6 +1884,7 @@ async fn main() -> Result<()> {
                 tx: tokio::sync::mpsc::Sender<skyclaw_core::types::message::InboundMessage>,
                 interrupt: Arc<AtomicBool>,
                 is_heartbeat: Arc<AtomicBool>,
+                cancel_token: tokio_util::sync::CancellationToken,
             }
 
             if let Some(sender) = primary_channel.clone() {
@@ -1926,6 +1927,7 @@ async fn main() -> Result<()> {
                                         "User message preempting active heartbeat task"
                                     );
                                     slot.interrupt.store(true, Ordering::Relaxed);
+                                    slot.cancel_token.cancel();
                                 }
 
                                 let is_stop = inbound
@@ -1940,6 +1942,7 @@ async fn main() -> Result<()> {
                                         "Stop command detected — interrupting active task"
                                     );
                                     slot.interrupt.store(true, Ordering::Relaxed);
+                                    slot.cancel_token.cancel();
                                     continue;
                                 }
 
@@ -1973,6 +1976,7 @@ async fn main() -> Result<()> {
 
                             let interrupt = Arc::new(AtomicBool::new(false));
                             let is_heartbeat = Arc::new(AtomicBool::new(false));
+                            let cancel_token = tokio_util::sync::CancellationToken::new();
 
                             let agent_state = agent_state_clone.clone();
                             let memory = memory_clone.clone();
@@ -1991,6 +1995,7 @@ async fn main() -> Result<()> {
                             let workspace_path = ws_path.clone();
                             let interrupt_clone = interrupt.clone();
                             let is_heartbeat_clone = is_heartbeat.clone();
+                            let cancel_token_clone = cancel_token.clone();
                             let pending_for_worker = pending_clone.clone();
                             let setup_tokens_worker = setup_tokens_clone.clone();
                             let pending_raw_keys_worker = pending_raw_keys_clone.clone();
@@ -2044,6 +2049,14 @@ async fn main() -> Result<()> {
                                     interrupt_clone.store(false, Ordering::Relaxed);
 
                                     let interrupt_flag = Some(interrupt_clone.clone());
+
+                                    // ── Phase 1: status watch + cancel token ──────
+                                    // Watch channel created per-message; future phases
+                                    // will expose the receiver to observers.
+                                    let (status_tx, _status_rx) = tokio::sync::watch::channel(
+                                        skyclaw_agent::AgentTaskStatus::default(),
+                                    );
+                                    let cancel = cancel_token_clone.clone();
 
                                     // ── Commands — intercepted before agent ──────
                                     let msg_text_cmd = msg.text.as_deref().unwrap_or("");
@@ -2761,7 +2774,7 @@ Just type a message to chat with the AI agent.",
                                         // next message — the user gets an error reply
                                         // instead of permanent silence.
                                         let process_result = AssertUnwindSafe(
-                                            agent.process_message(&msg, &mut session, interrupt_flag, Some(pending_for_worker.clone()), Some(early_tx))
+                                            agent.process_message(&msg, &mut session, interrupt_flag, Some(pending_for_worker.clone()), Some(early_tx), Some(status_tx), Some(cancel))
                                         )
                                         .catch_unwind()
                                         .await;
@@ -3169,7 +3182,7 @@ Just type a message to chat with the AI agent.",
                                 }
                             });
 
-                            ChatSlot { tx: chat_tx, interrupt, is_heartbeat }
+                            ChatSlot { tx: chat_tx, interrupt, is_heartbeat, cancel_token }
                         });
 
                         // Send message into the chat's dedicated queue.
@@ -4001,6 +4014,8 @@ Just type a message to chat with the AI agent.",
                         None,
                         None,
                         Some(early_tx),
+                        None,
+                        None,
                     ))
                     .catch_unwind()
                     .await;

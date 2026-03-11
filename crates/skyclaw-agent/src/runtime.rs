@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
+
 use base64::Engine;
 use skyclaw_core::types::error::SkyclawError;
 use skyclaw_core::types::message::{
@@ -25,6 +27,7 @@ use crate::output_compression::compress_tool_output;
 use skyclaw_core::types::error::classify_tool_failure;
 use skyclaw_core::types::optimization::VerifyMode;
 
+use crate::agent_task_status::{AgentTaskPhase, AgentTaskStatus};
 use crate::budget::{self, BudgetTracker, ModelPricing};
 use crate::circuit_breaker::CircuitBreaker;
 use crate::context::build_context;
@@ -188,6 +191,12 @@ impl AgentRuntime {
     /// - `pending`: shared queue of user messages that arrived while this task
     ///   is running. Pending texts are automatically appended to the last tool
     ///   result each round so the LLM sees them without extra API calls.
+    /// - `status_tx`: optional `watch` channel for real-time task status emission.
+    ///   If `None`, no status is emitted (zero overhead). `send_modify` is infallible.
+    /// - `cancel`: optional `CancellationToken` for future mid-stream cancellation.
+    ///   Phase 1: created and cancelled alongside `interrupt`, but not yet awaited
+    ///   in the loop. Phase 2 will add `tokio::select!` on provider calls.
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_message(
         &self,
         msg: &InboundMessage,
@@ -195,6 +204,8 @@ impl AgentRuntime {
         interrupt: Option<Arc<AtomicBool>>,
         pending: Option<PendingMessages>,
         reply_tx: Option<tokio::sync::mpsc::UnboundedSender<OutboundMessage>>,
+        status_tx: Option<tokio::sync::watch::Sender<AgentTaskStatus>>,
+        cancel: Option<CancellationToken>,
     ) -> Result<(OutboundMessage, TurnUsage), SkyclawError> {
         info!(
             channel = %msg.channel,
@@ -202,6 +213,12 @@ impl AgentRuntime {
             user_id = %msg.user_id,
             "Processing inbound message"
         );
+
+        // ── Status emission helper ──────────────────────────────
+        // Infallible: send_modify never panics, never allocates.
+        // If status_tx is None, the closure is a no-op (zero overhead).
+        // We capture `cancel` here only for future Phase 2 use.
+        let _cancel = cancel; // bind to suppress unused-variable warning
 
         // Per-turn usage accumulators
         let mut turn_api_calls: u32 = 0;
@@ -251,6 +268,14 @@ impl AgentRuntime {
                     "Detected credential"
                 );
             }
+        }
+
+        // ── Status: Preparing ────────────────────────────────────
+        // Emit after user text parsed and credentials scanned.
+        if let Some(ref tx) = status_tx {
+            tx.send_modify(|s| {
+                s.phase = AgentTaskPhase::Preparing;
+            });
         }
 
         // ── Vision: load image attachments ──────────────────────────
@@ -328,6 +353,13 @@ impl AgentRuntime {
             session.history.push(ChatMessage {
                 role: Role::User,
                 content: MessageContent::Parts(parts),
+            });
+        }
+
+        // ── Status: Classifying ──────────────────────────────────
+        if let Some(ref tx) = status_tx {
+            tx.send_modify(|s| {
+                s.phase = AgentTaskPhase::Classifying;
             });
         }
 
@@ -476,7 +508,7 @@ impl AgentRuntime {
 
         // Tool-use loop
         let task_start = Instant::now();
-        let mut rounds = 0;
+        let mut rounds: usize = 0;
         let mut interrupted = false;
         loop {
             rounds += 1;
@@ -488,6 +520,14 @@ impl AgentRuntime {
                         "Agent interrupted by higher-priority message after {} rounds",
                         rounds - 1
                     );
+                    // ── Status: Interrupted ──────────────────────
+                    if let Some(ref tx) = status_tx {
+                        tx.send_modify(|s| {
+                            s.phase = AgentTaskPhase::Interrupted {
+                                round: rounds as u32,
+                            };
+                        });
+                    }
                     interrupted = true;
                     break;
                 }
@@ -573,6 +613,15 @@ impl AgentRuntime {
                 ));
             }
 
+            // ── Status: CallingProvider ─────────────────────────────
+            if let Some(ref tx) = status_tx {
+                tx.send_modify(|s| {
+                    s.phase = AgentTaskPhase::CallingProvider {
+                        round: rounds as u32,
+                    };
+                });
+            }
+
             let response = match self.provider.complete(request).await {
                 Ok(resp) => {
                     self.circuit_breaker.record_success();
@@ -602,6 +651,15 @@ impl AgentRuntime {
             turn_output_tokens = turn_output_tokens.saturating_add(response.usage.output_tokens);
             turn_cost_usd += call_cost;
 
+            // ── Status: update token/cost counters ──────────────
+            if let Some(ref tx) = status_tx {
+                tx.send_modify(|s| {
+                    s.input_tokens = turn_input_tokens;
+                    s.output_tokens = turn_output_tokens;
+                    s.cost_usd = turn_cost_usd;
+                });
+            }
+
             // Separate text content from tool-use content
             let mut text_parts: Vec<String> = Vec::new();
             let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
@@ -622,6 +680,12 @@ impl AgentRuntime {
 
             // If no tool calls, we have our final reply
             if tool_uses.is_empty() {
+                // ── Status: Finishing ────────────────────────────────
+                if let Some(ref tx) = status_tx {
+                    tx.send_modify(|s| {
+                        s.phase = AgentTaskPhase::Finishing;
+                    });
+                }
                 let mut reply_text = text_parts.join("\n");
 
                 // For compound tasks, append a DONE verification reminder
@@ -682,6 +746,14 @@ impl AgentRuntime {
                     }
                 }
 
+                // ── Status: Done ─────────────────────────────────
+                if let Some(ref tx) = status_tx {
+                    tx.send_modify(|s| {
+                        s.phase = AgentTaskPhase::Done;
+                        s.tools_executed = turn_tools_used;
+                    });
+                }
+
                 return Ok((
                     OutboundMessage {
                         chat_id: msg.chat_id.clone(),
@@ -710,9 +782,25 @@ impl AgentRuntime {
             // Execute each tool call and collect results
             let mut tool_result_parts: Vec<ContentPart> = Vec::new();
 
-            for (tool_use_id, tool_name, arguments) in &tool_uses {
+            let tool_total = tool_uses.len() as u32;
+            for (tool_index, (tool_use_id, tool_name, arguments)) in tool_uses.iter().enumerate() {
                 turn_tools_used = turn_tools_used.saturating_add(1);
                 info!(tool = %tool_name, id = %tool_use_id, "Executing tool call");
+
+                // ── Status: ExecutingTool ────────────────────────
+                if let Some(ref tx) = status_tx {
+                    let tname = tool_name.clone();
+                    let tidx = tool_index as u32;
+                    let ttotal = tool_total;
+                    tx.send_modify(|s| {
+                        s.phase = AgentTaskPhase::ExecutingTool {
+                            round: rounds as u32,
+                            tool_name: tname,
+                            tool_index: tidx,
+                            tool_total: ttotal,
+                        };
+                    });
+                }
 
                 let result = execute_tool(tool_name, arguments.clone(), &self.tools, session).await;
 
@@ -871,8 +959,26 @@ impl AgentRuntime {
                 }
             }
 
+            // ── Status: round completed ─────────────────────────
+            if let Some(ref tx) = status_tx {
+                tx.send_modify(|s| {
+                    s.rounds_completed = rounds as u32;
+                    s.tools_executed = turn_tools_used;
+                });
+            }
+
             // Continue the loop — provider will see the tool results and may
             // issue more tool calls or produce a final text reply.
+        }
+
+        // ── Status: Done (fallback exit) ────────────────────────
+        if let Some(ref tx) = status_tx {
+            tx.send_modify(|s| {
+                if !matches!(s.phase, AgentTaskPhase::Interrupted { .. }) {
+                    s.phase = AgentTaskPhase::Done;
+                }
+                s.tools_executed = turn_tools_used;
+            });
         }
 
         // Fallback: exited loop due to interruption or max rounds

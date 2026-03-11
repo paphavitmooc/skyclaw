@@ -1,6 +1,7 @@
 //! SkyClaw Agent crate — the core agent runtime that processes messages
 //! through AI providers with tool execution support.
 
+pub mod agent_task_status;
 pub mod budget;
 pub mod circuit_breaker;
 pub mod context;
@@ -24,6 +25,7 @@ pub mod task_decomposition;
 pub mod task_queue;
 pub mod watchdog;
 
+pub use agent_task_status::{AgentTaskPhase, AgentTaskStatus};
 pub use budget::BudgetTracker;
 pub use circuit_breaker::CircuitBreaker;
 pub use delegation::{DelegationManager, SubAgent, SubAgentResult, SubAgentStatus};
