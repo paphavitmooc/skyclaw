@@ -44,7 +44,7 @@ const MEMORY_BUDGET_FRACTION: f32 = 0.15;
 const LEARNING_BUDGET_FRACTION: f32 = 0.05;
 
 /// Estimate token count from a string (rough: 1 token ≈ 4 chars).
-fn estimate_tokens(s: &str) -> usize {
+pub(crate) fn estimate_tokens(s: &str) -> usize {
     s.len() / 4
 }
 
@@ -69,6 +69,11 @@ fn estimate_message_tokens(msg: &ChatMessage) -> usize {
 
 /// Build a CompletionRequest from all available context using priority-based
 /// token budgeting.
+///
+/// `matched_blueprints` is the set of blueprints matching the classifier's
+/// `blueprint_hint` (sorted by success rate, best first). The context builder
+/// automatically selects the best one, injects its body/outline, and adds a
+/// compact catalog section. Pass an empty slice when no blueprints matched.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_context(
     session: &SessionContext,
@@ -79,6 +84,7 @@ pub async fn build_context(
     max_turns: usize,
     max_context_tokens: usize,
     prompt_tier: Option<PromptTier>,
+    matched_blueprints: &[crate::blueprint::Blueprint],
 ) -> CompletionRequest {
     let budget = max_context_tokens;
 
@@ -122,6 +128,74 @@ pub async fn build_context(
     let overhead = 500;
     let fixed_tokens = system_tokens + tool_def_tokens + overhead;
 
+    // ── Category 3b: Blueprints (up to 10% of budget) ──────────
+    // Blueprint injection uses graceful degradation:
+    //   - Best blueprint fits in 10% budget → inject full body
+    //   - Best blueprint > 10% but < 25% of context → inject outline
+    //   - Best blueprint > 25% of context → catalog only (no body)
+    //   - Always inject catalog if any blueprints matched
+    const BLUEPRINT_BUDGET_FRACTION: f32 = 0.10;
+    let mut blueprint_messages: Vec<ChatMessage> = Vec::new();
+    let mut blueprint_tokens_used = 0;
+    let mut loaded_blueprint_id: Option<String> = None;
+
+    if !matched_blueprints.is_empty() {
+        let bp_budget = ((budget as f32) * BLUEPRINT_BUDGET_FRACTION) as usize;
+
+        // Select best blueprint for body injection
+        if let Some(best) =
+            crate::blueprint::select_best_blueprint(matched_blueprints, bp_budget, budget)
+        {
+            if best.token_count <= bp_budget {
+                // Full body fits in budget
+                let bp_text = crate::blueprint::format_blueprint_context(best);
+                let tokens = estimate_tokens(&bp_text);
+                blueprint_messages.push(ChatMessage {
+                    role: Role::System,
+                    content: MessageContent::Text(bp_text),
+                });
+                blueprint_tokens_used = tokens;
+                loaded_blueprint_id = Some(best.id.clone());
+                debug!(
+                    name = %best.name,
+                    version = best.version,
+                    tokens = tokens,
+                    "Blueprint full body injected into context"
+                );
+            } else {
+                // Body too large for budget — inject outline instead
+                let outline = crate::blueprint::format_blueprint_outline(best);
+                let tokens = estimate_tokens(&outline);
+                blueprint_messages.push(ChatMessage {
+                    role: Role::System,
+                    content: MessageContent::Text(outline),
+                });
+                blueprint_tokens_used = tokens;
+                loaded_blueprint_id = Some(best.id.clone());
+                debug!(
+                    name = %best.name,
+                    token_count = best.token_count,
+                    budget = bp_budget,
+                    "Blueprint outline injected (full body too large)"
+                );
+            }
+        }
+
+        // Always inject the compact catalog so the LLM knows what's available
+        let catalog = crate::blueprint::format_blueprint_catalog(
+            matched_blueprints,
+            loaded_blueprint_id.as_deref(),
+        );
+        if !catalog.is_empty() {
+            let catalog_tokens = estimate_tokens(&catalog);
+            blueprint_messages.push(ChatMessage {
+                role: Role::System,
+                content: MessageContent::Text(catalog),
+            });
+            blueprint_tokens_used += catalog_tokens;
+        }
+    }
+
     // ── Category 3: Task state / DONE criteria ─────────────────────
     // These are already in session.history as System messages injected by
     // the DONE Definition Engine. They will be included via the recent
@@ -139,7 +213,8 @@ pub async fn build_context(
     let recent_messages: Vec<ChatMessage> = history[recent_start..].to_vec();
     let recent_tokens: usize = recent_messages.iter().map(estimate_message_tokens).sum();
 
-    let available_after_fixed_and_recent = budget.saturating_sub(fixed_tokens + recent_tokens);
+    let available_after_fixed_and_recent =
+        budget.saturating_sub(fixed_tokens + recent_tokens + blueprint_tokens_used);
 
     // ── Category 5: Memory search results (up to 15% of budget) ────
     let memory_budget = ((budget as f32) * MEMORY_BUDGET_FRACTION) as usize;
@@ -282,6 +357,7 @@ pub async fn build_context(
     // ── Category 7: Older conversation history ─────────────────────
     let used_tokens = fixed_tokens
         + recent_tokens
+        + blueprint_tokens_used
         + memory_tokens_used
         + knowledge_tokens_used
         + learning_tokens_used;
@@ -348,12 +424,13 @@ pub async fn build_context(
     let chat_digest = build_chat_digest(&all_messages_for_digest);
 
     // ── Assemble final message list ────────────────────────────────
-    // Order: summary → chat digest → knowledge → memory → learnings → older history → recent messages
+    // Order: summary → chat digest → blueprint → knowledge → memory → learnings → older history → recent messages
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.extend(summary_messages);
     if let Some(digest_msg) = chat_digest {
         messages.push(digest_msg);
     }
+    messages.extend(blueprint_messages);
     messages.extend(knowledge_messages);
     messages.extend(memory_messages);
     messages.extend(learning_messages);
@@ -365,6 +442,7 @@ pub async fn build_context(
     debug!(
         system = system_tokens,
         tools = tool_def_tokens,
+        blueprint = blueprint_tokens_used,
         recent = recent_tokens,
         memory = memory_tokens_used,
         knowledge = knowledge_tokens_used,
@@ -375,6 +453,26 @@ pub async fn build_context(
         dropped = dropped_count,
         "Context budget allocation"
     );
+
+    // ── Resource Budget Dashboard ───────────────────────────────
+    // Inject into system prompt so the LLM sees its own resource
+    // consumption and limits — the brain must know its skull size.
+    let bp_budget_total = ((budget as f32) * BLUEPRINT_BUDGET_FRACTION) as usize;
+    let bp_budget_remaining = bp_budget_total.saturating_sub(blueprint_tokens_used);
+    let dashboard = format_budget_dashboard(
+        model,
+        budget,
+        system_tokens,
+        tool_def_tokens,
+        blueprint_tokens_used,
+        memory_tokens_used + knowledge_tokens_used,
+        learning_tokens_used,
+        older_tokens_used + recent_tokens,
+        bp_budget_remaining,
+        bp_budget_total,
+    );
+    // Append dashboard to the system prompt
+    let system = system.map(|s| format!("{s}\n\n{dashboard}"));
 
     // ── Vision safety: strip image parts for non-vision models ─────
     // If the model doesn't support vision, remove all ImageUrl parts
@@ -514,6 +612,47 @@ fn build_chat_digest(messages: &[&ChatMessage]) -> Option<ChatMessage> {
             digest_text
         )),
     })
+}
+
+/// Format the Resource Budget Dashboard for system prompt injection.
+///
+/// Shows the LLM its own resource consumption and limits so it can
+/// make informed decisions about what to load (blueprints, memory, etc.).
+#[allow(clippy::too_many_arguments)]
+fn format_budget_dashboard(
+    model: &str,
+    total_limit: usize,
+    system_tokens: usize,
+    tool_tokens: usize,
+    blueprint_tokens: usize,
+    memory_tokens: usize,
+    learning_tokens: usize,
+    history_tokens: usize,
+    blueprint_budget_remaining: usize,
+    blueprint_budget_total: usize,
+) -> String {
+    let used = system_tokens
+        + tool_tokens
+        + blueprint_tokens
+        + memory_tokens
+        + learning_tokens
+        + history_tokens;
+    let available = total_limit.saturating_sub(used);
+
+    format!(
+        "=== CONTEXT BUDGET ===\n\
+         Model: {model} | Limit: {total_limit} tokens\n\
+         Used: {used} tokens\n\
+         \x20 System:     {system_tokens}\n\
+         \x20 Tools:      {tool_tokens}\n\
+         \x20 Blueprint:  {blueprint_tokens}\n\
+         \x20 Memory:     {memory_tokens}\n\
+         \x20 Learnings:  {learning_tokens}\n\
+         \x20 History:    {history_tokens}\n\
+         Available: {available} tokens\n\
+         Blueprint budget: {blueprint_budget_remaining} / {blueprint_budget_total} remaining\n\
+         === END BUDGET ==="
+    )
 }
 
 /// Extract the latest user query text from history.
@@ -664,9 +803,11 @@ mod tests {
             6,
             30_000,
             None,
+            &[],
         )
         .await;
-        assert_eq!(req.system.as_deref(), Some("Custom prompt"));
+        // System prompt now includes the budget dashboard appended
+        assert!(req.system.as_ref().unwrap().starts_with("Custom prompt"));
         assert_eq!(req.model, "test-model");
     }
 
@@ -685,6 +826,7 @@ mod tests {
             6,
             30_000,
             None,
+            &[],
         )
         .await;
         assert!(req.system.is_some());
@@ -700,7 +842,18 @@ mod tests {
         ];
         let session = make_session();
 
-        let req = build_context(&session, &memory, &tools, "model", None, 6, 30_000, None).await;
+        let req = build_context(
+            &session,
+            &memory,
+            &tools,
+            "model",
+            None,
+            6,
+            30_000,
+            None,
+            &[],
+        )
+        .await;
         assert_eq!(req.tools.len(), 2);
         assert_eq!(req.tools[0].name, "shell");
         assert_eq!(req.tools[1].name, "browser");
@@ -720,7 +873,18 @@ mod tests {
             content: MessageContent::Text("Hi there".to_string()),
         });
 
-        let req = build_context(&session, &memory, &tools, "model", None, 6, 30_000, None).await;
+        let req = build_context(
+            &session,
+            &memory,
+            &tools,
+            "model",
+            None,
+            6,
+            30_000,
+            None,
+            &[],
+        )
+        .await;
         // Messages should include the history
         assert!(req.messages.len() >= 2);
     }
@@ -744,7 +908,18 @@ mod tests {
         }
 
         // Use a very small budget to force dropping older messages
-        let req = build_context(&session, &memory, &tools, "model", None, 200, 2_000, None).await;
+        let req = build_context(
+            &session,
+            &memory,
+            &tools,
+            "model",
+            None,
+            200,
+            2_000,
+            None,
+            &[],
+        )
+        .await;
 
         // The most recent messages should always be present
         let last_msg = req.messages.last().expect("messages should not be empty");
@@ -775,7 +950,18 @@ mod tests {
         }
 
         // Budget of 2000 tokens can't fit all 5000 tokens of messages + system prompt
-        let req = build_context(&session, &memory, &tools, "model", None, 200, 2_000, None).await;
+        let req = build_context(
+            &session,
+            &memory,
+            &tools,
+            "model",
+            None,
+            200,
+            2_000,
+            None,
+            &[],
+        )
+        .await;
 
         // Check that a summary message was injected
         let has_summary = req.messages.iter().any(|m| {
@@ -987,7 +1173,18 @@ mod tests {
             });
         }
 
-        let req = build_context(&session, &memory, &tools, "model", None, 200, 100_000, None).await;
+        let req = build_context(
+            &session,
+            &memory,
+            &tools,
+            "model",
+            None,
+            200,
+            100_000,
+            None,
+            &[],
+        )
+        .await;
 
         // Should have a chat digest in the messages
         let has_digest = req.messages.iter().any(|m| {

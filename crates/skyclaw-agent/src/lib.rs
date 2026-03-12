@@ -2,6 +2,7 @@
 //! through AI providers with tool execution support.
 
 pub mod agent_task_status;
+pub mod blueprint;
 pub mod budget;
 pub mod circuit_breaker;
 pub mod context;
@@ -27,6 +28,7 @@ pub mod task_queue;
 pub mod watchdog;
 
 pub use agent_task_status::{AgentTaskPhase, AgentTaskStatus};
+pub use blueprint::Blueprint;
 pub use budget::BudgetTracker;
 pub use circuit_breaker::CircuitBreaker;
 pub use delegation::{DelegationManager, SubAgent, SubAgentResult, SubAgentStatus};

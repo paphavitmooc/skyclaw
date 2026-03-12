@@ -21,6 +21,11 @@ pub struct MessageClassification {
     pub category: MessageCategory,
     pub chat_text: String,
     pub difficulty: TaskDifficulty,
+    /// Optional blueprint category hint from the classifier.
+    /// Used to fetch relevant blueprints by semantic tag.
+    /// null/absent for chat and stop messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blueprint_hint: Option<String>,
 }
 
 /// Whether a message is conversational, an actionable order, or a stop request.
@@ -52,7 +57,7 @@ impl TaskDifficulty {
     }
 }
 
-const CLASSIFY_SYSTEM_PROMPT: &str = r#"You are SkyClaw, an AI assistant. Classify the user's message and respond with ONLY a valid JSON object. No markdown, no explanation — just the JSON.
+const CLASSIFY_BASE_PROMPT: &str = r#"You are SkyClaw, an AI assistant. Classify the user's message and respond with ONLY a valid JSON object. No markdown, no explanation — just the JSON.
 
 Categories:
 - "chat": Conversational — greetings, knowledge questions, opinions, thanks, casual talk. You provide a complete helpful response.
@@ -74,9 +79,39 @@ Rules:
 - difficulty is only meaningful for "order". For "chat" and "stop", always use "simple".
 - Respond in the SAME LANGUAGE as the user's message."#;
 
+/// Build the classifier system prompt, optionally including available blueprint
+/// categories for the `blueprint_hint` field.
+///
+/// When categories are available, the classifier picks from the grounded set
+/// (actual stored categories from memory). This enables zero-extra-LLM-call
+/// blueprint matching downstream.
+fn build_classify_prompt(available_categories: &[String]) -> String {
+    let mut prompt = CLASSIFY_BASE_PROMPT.to_string();
+
+    if !available_categories.is_empty() {
+        let cats_json = serde_json::to_string(available_categories).unwrap_or_default();
+        prompt.push_str(&format!(
+            r#"
+
+Blueprint hint (for "order" messages only):
+- If the task relates to one of these categories, include "blueprint_hint" in your JSON: {cats}
+- Pick EXACTLY from this list or omit the field entirely. Never invent categories.
+- For "chat" and "stop", never include blueprint_hint.
+- Example with hint: {{"category":"order","chat_text":"On it!","difficulty":"standard","blueprint_hint":"deployment"}}"#,
+            cats = cats_json,
+        ));
+    }
+
+    prompt
+}
+
 /// Classify a user message using a fast LLM call.
 ///
 /// `history` must already include the current user message as its last element.
+/// `available_blueprint_categories` is the grounded set of categories from stored
+/// blueprints. When non-empty, the classifier may emit a `blueprint_hint` field
+/// for "order" messages, enabling zero-extra-LLM-call blueprint matching.
+///
 /// Returns the classification and the raw usage for budget tracking.
 /// Falls back with an error if the provider call or JSON parsing fails —
 /// the caller should use rule-based classification as fallback.
@@ -85,6 +120,7 @@ pub async fn classify_message(
     model: &str,
     _user_text: &str,
     history: &[ChatMessage],
+    available_blueprint_categories: &[String],
 ) -> Result<(MessageClassification, Usage), SkyclawError> {
     // Use last 10 history messages for conversational context.
     // History already includes the current user message (pushed by runtime
@@ -92,13 +128,15 @@ pub async fn classify_message(
     let context_start = history.len().saturating_sub(10);
     let messages: Vec<ChatMessage> = history[context_start..].to_vec();
 
+    let system_prompt = build_classify_prompt(available_blueprint_categories);
+
     let request = CompletionRequest {
         model: model.to_string(),
         messages,
         tools: vec![],
         max_tokens: Some(1000),
         temperature: Some(0.0),
-        system: Some(CLASSIFY_SYSTEM_PROMPT.to_string()),
+        system: Some(system_prompt),
     };
 
     debug!("LLM classify: sending classification request");
@@ -297,11 +335,66 @@ mod tests {
             category: MessageCategory::Order,
             chat_text: "Looking into it!".to_string(),
             difficulty: TaskDifficulty::Standard,
+            blueprint_hint: None,
         };
         let json = serde_json::to_string(&classification).unwrap();
         let restored: MessageClassification = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.category, MessageCategory::Order);
         assert_eq!(restored.chat_text, "Looking into it!");
         assert_eq!(restored.difficulty, TaskDifficulty::Standard);
+        assert!(restored.blueprint_hint.is_none());
+    }
+
+    #[test]
+    fn parse_order_with_blueprint_hint() {
+        let json = r#"{"category":"order","chat_text":"On it!","difficulty":"standard","blueprint_hint":"deployment"}"#;
+        let result = parse_classification(json).unwrap();
+        assert_eq!(result.category, MessageCategory::Order);
+        assert_eq!(result.blueprint_hint, Some("deployment".to_string()));
+    }
+
+    #[test]
+    fn parse_order_without_blueprint_hint() {
+        let json = r#"{"category":"order","chat_text":"Sure!","difficulty":"simple"}"#;
+        let result = parse_classification(json).unwrap();
+        assert!(result.blueprint_hint.is_none());
+    }
+
+    #[test]
+    fn parse_order_with_null_blueprint_hint() {
+        let json = r#"{"category":"order","chat_text":"OK!","difficulty":"complex","blueprint_hint":null}"#;
+        let result = parse_classification(json).unwrap();
+        assert!(result.blueprint_hint.is_none());
+    }
+
+    #[test]
+    fn classification_with_hint_serde_roundtrip() {
+        let classification = MessageClassification {
+            category: MessageCategory::Order,
+            chat_text: "Deploying now!".to_string(),
+            difficulty: TaskDifficulty::Complex,
+            blueprint_hint: Some("deployment".to_string()),
+        };
+        let json = serde_json::to_string(&classification).unwrap();
+        assert!(json.contains("blueprint_hint"));
+        let restored: MessageClassification = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.blueprint_hint, Some("deployment".to_string()));
+    }
+
+    #[test]
+    fn build_prompt_without_categories() {
+        let prompt = build_classify_prompt(&[]);
+        assert!(prompt.contains("Classify the user's message"));
+        assert!(!prompt.contains("blueprint_hint"));
+    }
+
+    #[test]
+    fn build_prompt_with_categories() {
+        let categories = vec!["deployment".to_string(), "code-analysis".to_string()];
+        let prompt = build_classify_prompt(&categories);
+        assert!(prompt.contains("blueprint_hint"));
+        assert!(prompt.contains("deployment"));
+        assert!(prompt.contains("code-analysis"));
+        assert!(prompt.contains("Never invent categories"));
     }
 }

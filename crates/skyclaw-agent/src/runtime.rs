@@ -364,6 +364,14 @@ impl AgentRuntime {
             });
         }
 
+        // ── Blueprint Categories (pre-classifier) ───────────────────
+        // Fetch the grounded set of categories from stored blueprints.
+        // These feed into the classifier so it can emit a blueprint_hint
+        // without an extra LLM call.
+        let blueprint_categories =
+            crate::blueprint::fetch_available_categories(self.memory.as_ref()).await;
+        let mut blueprint_hint: Option<String> = None;
+
         // ── V2 LLM Classification ─────────────────────────────────────
         // Classify the message as "chat" or "order" using a fast LLM call.
         //   Chat  → return immediately with the LLM's response (1 call total).
@@ -374,6 +382,7 @@ impl AgentRuntime {
                 &self.model,
                 &user_text,
                 &session.history,
+                &blueprint_categories,
             )
             .await
             {
@@ -460,6 +469,11 @@ impl AgentRuntime {
                         }
                         crate::llm_classifier::MessageCategory::Order => {
                             // ── Order: send ack, then continue pipeline ──
+                            // Extract blueprint hint from classifier (v2 matching)
+                            blueprint_hint = classification.blueprint_hint.clone();
+                            if let Some(ref hint) = blueprint_hint {
+                                info!(hint = %hint, "Classifier provided blueprint hint");
+                            }
                             if let Some(ref tx) = reply_tx {
                                 let ack = OutboundMessage {
                                     chat_id: msg.chat_id.clone(),
@@ -532,6 +546,29 @@ impl AgentRuntime {
             None
         };
 
+        // ── Blueprint Matching (v2: category-based, zero extra LLM calls) ─
+        // Use the classifier's blueprint_hint to fetch blueprints by category.
+        // The context builder handles selection, catalog, and budget enforcement.
+        let matched_blueprints: Vec<crate::blueprint::Blueprint> =
+            if let Some(ref hint) = blueprint_hint {
+                crate::blueprint::fetch_by_category(self.memory.as_ref(), hint).await
+            } else {
+                Vec::new()
+            };
+
+        // Identify the "active" blueprint (best match) for post-task refinement.
+        let active_blueprint: Option<crate::blueprint::Blueprint> =
+            if !matched_blueprints.is_empty() {
+                crate::blueprint::select_best_blueprint(
+                    &matched_blueprints,
+                    ((self.max_context_tokens as f32) * 0.10) as usize,
+                    self.max_context_tokens,
+                )
+                .cloned()
+            } else {
+                None
+            };
+
         // ── Self-Correction Engine ─────────────────────────────────
         // Track consecutive tool failures per tool name.
         let mut failure_tracker = FailureTracker::new(self.max_consecutive_failures);
@@ -599,6 +636,7 @@ impl AgentRuntime {
                 self.max_turns,
                 self.max_context_tokens,
                 prompt_tier,
+                &matched_blueprints,
             )
             .await;
 
@@ -891,6 +929,131 @@ impl AgentRuntime {
                             outcome = ?l.outcome,
                             "Persisted task learning"
                         );
+                    }
+                }
+
+                // ── Blueprint Authoring (async, non-blocking) ──────────
+                // After learnings are persisted, check if this task warrants
+                // a Blueprint. Authoring makes a separate LLM call, so we
+                // spawn it as a background task to avoid blocking the response.
+                {
+                    let tools_used = crate::blueprint::extract_tools_used(&session.history);
+                    let exec_meta = crate::blueprint::TaskExecutionMeta {
+                        tool_calls: rounds as u32,
+                        tools_used,
+                        duration_secs: task_start.elapsed().as_secs(),
+                        outcome: if interrupted {
+                            crate::blueprint::TaskExecutionOutcome::Partial
+                        } else if learnings
+                            .first()
+                            .is_some_and(|l| l.outcome == learning::TaskOutcome::Failure)
+                        {
+                            crate::blueprint::TaskExecutionOutcome::Failure
+                        } else if learnings
+                            .first()
+                            .is_some_and(|l| l.outcome == learning::TaskOutcome::Partial)
+                        {
+                            crate::blueprint::TaskExecutionOutcome::Partial
+                        } else {
+                            crate::blueprint::TaskExecutionOutcome::Success
+                        },
+                        is_compound,
+                    };
+
+                    let blueprint_was_loaded = active_blueprint.is_some();
+
+                    if crate::blueprint::should_create_blueprint(&exec_meta, blueprint_was_loaded) {
+                        // Author a new blueprint in the background
+                        let prompt =
+                            crate::blueprint::build_authoring_prompt(&session.history, &exec_meta);
+                        let memory = Arc::clone(&self.memory);
+                        let provider = Arc::clone(&self.provider);
+                        let model = self.model.clone();
+                        let user_id = msg.user_id.clone();
+                        let session_id = session.session_id.clone();
+
+                        tokio::spawn(async move {
+                            match author_blueprint(provider.as_ref(), &model, &prompt, &user_id)
+                                .await
+                            {
+                                Ok(bp) => {
+                                    let entry =
+                                        crate::blueprint::to_memory_entry(&bp, Some(session_id));
+                                    if let Err(e) = memory.store(entry).await {
+                                        warn!(error = %e, "Failed to store blueprint");
+                                    } else {
+                                        info!(
+                                            id = %bp.id,
+                                            name = %bp.name,
+                                            "Blueprint authored and stored"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Blueprint authoring failed — skipping");
+                                }
+                            }
+                        });
+                    } else if blueprint_was_loaded {
+                        // Refine the existing blueprint in the background
+                        if let Some(ref loaded_bp) = active_blueprint {
+                            let prompt =
+                                crate::blueprint::build_refinement_prompt(loaded_bp, &exec_meta);
+                            let memory = Arc::clone(&self.memory);
+                            let provider = Arc::clone(&self.provider);
+                            let model = self.model.clone();
+                            let bp_id = loaded_bp.id.clone();
+                            let session_id = session.session_id.clone();
+                            let mut updated_bp = loaded_bp.clone();
+                            updated_bp.version += 1;
+                            updated_bp.times_executed += 1;
+                            match exec_meta.outcome {
+                                crate::blueprint::TaskExecutionOutcome::Success => {
+                                    updated_bp.times_succeeded += 1;
+                                }
+                                crate::blueprint::TaskExecutionOutcome::Failure => {
+                                    updated_bp.times_failed += 1;
+                                }
+                                crate::blueprint::TaskExecutionOutcome::Partial => {}
+                            }
+                            updated_bp.updated = chrono::Utc::now();
+
+                            tokio::spawn(async move {
+                                match refine_blueprint(
+                                    provider.as_ref(),
+                                    &model,
+                                    &prompt,
+                                    &mut updated_bp,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        let entry = crate::blueprint::to_memory_entry(
+                                            &updated_bp,
+                                            Some(session_id),
+                                        );
+                                        if let Err(e) = memory.store(entry).await {
+                                            warn!(
+                                                error = %e,
+                                                "Failed to store refined blueprint"
+                                            );
+                                        } else {
+                                            info!(
+                                                id = %bp_id,
+                                                version = updated_bp.version,
+                                                "Blueprint refined and stored"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            "Blueprint refinement failed — keeping original"
+                                        );
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
 
@@ -1255,6 +1418,109 @@ impl AgentRuntime {
     pub fn max_task_duration(&self) -> Duration {
         self.max_task_duration
     }
+}
+
+// ---------------------------------------------------------------------------
+// Blueprint authoring / refinement helpers (fire-and-forget from tokio::spawn)
+// ---------------------------------------------------------------------------
+
+/// Make a single LLM call to author a Blueprint. Parses the response into a
+/// Blueprint struct. Called from a background task — errors are logged, not
+/// propagated to the user.
+async fn author_blueprint(
+    provider: &dyn Provider,
+    model: &str,
+    prompt: &str,
+    user_id: &str,
+) -> Result<crate::blueprint::Blueprint, SkyclawError> {
+    use skyclaw_core::types::message::{CompletionRequest, MessageContent, Role};
+
+    let request = CompletionRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: MessageContent::Text(prompt.to_string()),
+        }],
+        tools: vec![],
+        max_tokens: Some(4096),
+        temperature: Some(0.3),
+        system: Some(
+            "You are a technical writer. Output SKIP if the task is not worth a blueprint, \
+             or the full Blueprint document otherwise. Nothing else."
+                .to_string(),
+        ),
+    };
+
+    let response = provider.complete(request).await?;
+    let text = extract_text_from_response(&response.content);
+    if text.is_empty() {
+        return Err(SkyclawError::Provider(
+            "Blueprint authoring returned no text".into(),
+        ));
+    }
+
+    // LLM decided this task isn't worth a blueprint
+    if text.trim().eq_ignore_ascii_case("skip") {
+        return Err(SkyclawError::Provider(
+            "LLM declined blueprint: SKIP".into(),
+        ));
+    }
+
+    let mut bp = crate::blueprint::parse_blueprint(&text)
+        .map_err(|e| SkyclawError::Provider(format!("Failed to parse authored blueprint: {e}")))?;
+    bp.owner_user_id = user_id.to_string();
+    Ok(bp)
+}
+
+/// Make a single LLM call to refine a Blueprint. Updates the body in-place.
+async fn refine_blueprint(
+    provider: &dyn Provider,
+    model: &str,
+    prompt: &str,
+    blueprint: &mut crate::blueprint::Blueprint,
+) -> Result<(), SkyclawError> {
+    use skyclaw_core::types::message::{CompletionRequest, MessageContent, Role};
+
+    let request = CompletionRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: MessageContent::Text(prompt.to_string()),
+        }],
+        tools: vec![],
+        max_tokens: Some(4096),
+        temperature: Some(0.3),
+        system: Some(
+            "You are a technical writer. Output only the updated Blueprint document, nothing else."
+                .to_string(),
+        ),
+    };
+
+    let response = provider.complete(request).await?;
+    let text = extract_text_from_response(&response.content);
+    if text.is_empty() {
+        return Err(SkyclawError::Provider(
+            "Blueprint refinement returned no text".into(),
+        ));
+    }
+
+    let refined = crate::blueprint::parse_blueprint(&text)
+        .map_err(|e| SkyclawError::Provider(format!("Failed to parse refined blueprint: {e}")))?;
+    blueprint.body = refined.body;
+    Ok(())
+}
+
+/// Extract concatenated text from a CompletionResponse's content parts.
+fn extract_text_from_response(content: &[skyclaw_core::types::message::ContentPart]) -> String {
+    use skyclaw_core::types::message::ContentPart;
+    content
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Check whether a model supports vision (image) inputs.

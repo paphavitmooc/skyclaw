@@ -306,6 +306,7 @@ fn entry_type_to_str(et: &MemoryEntryType) -> &'static str {
         MemoryEntryType::DailyLog => "daily_log",
         MemoryEntryType::Skill => "skill",
         MemoryEntryType::Knowledge => "knowledge",
+        MemoryEntryType::Blueprint => "blueprint",
     }
 }
 
@@ -316,6 +317,7 @@ fn str_to_entry_type(s: &str) -> Result<MemoryEntryType, SkyclawError> {
         "daily_log" => Ok(MemoryEntryType::DailyLog),
         "skill" => Ok(MemoryEntryType::Skill),
         "knowledge" => Ok(MemoryEntryType::Knowledge),
+        "blueprint" => Ok(MemoryEntryType::Blueprint),
         other => Err(SkyclawError::Memory(format!("Unknown entry type: {other}"))),
     }
 }

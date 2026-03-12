@@ -20,6 +20,7 @@ pub enum MemoryEntryType {
     DailyLog,
     Skill,
     Knowledge,
+    Blueprint,
 }
 
 /// Search options for memory queries

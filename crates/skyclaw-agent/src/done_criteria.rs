@@ -130,6 +130,13 @@ pub fn is_compound_task(text: &str) -> bool {
         "save",
         "edit",
         "modify",
+        "scan",
+        "count",
+        "find",
+        "search",
+        "analyze",
+        "generate",
+        "list",
     ];
 
     let lower = trimmed.to_lowercase();

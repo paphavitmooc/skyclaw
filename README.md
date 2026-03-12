@@ -11,247 +11,171 @@
   <a href="https://discord.gg/3ux2c5xz"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License">
   <img src="https://img.shields.io/badge/version-2.4.1-blue.svg" alt="Version">
-  <img src="https://img.shields.io/badge/tests-1343-green.svg" alt="1343 tests">
+  <img src="https://img.shields.io/badge/tests-1378-green.svg" alt="1378 tests">
   <img src="https://img.shields.io/badge/providers-8-red.svg" alt="8 providers">
 </p>
 
 # SkyClaw
 
-Hyper-performance Rust agent runtime with extreme resilience and continuous self-learning.
+Autonomous AI agent runtime in Rust. Treats the LLM as a finite brain — not a text generator — with procedural memory, resource-aware context management, and zero-downtime resilience.
+
 Deploys once, stays up forever. Learns from every task, remembers across sessions, self-heals through failures.
 
-**v2.4: Interceptor** — real-time task status observation. Agent work becomes an observable TASK with status emission at 10 checkpoints. CancellationToken infrastructure for future mid-stream cancellation. Prompted tool calling fallback — models that don't support native function calling automatically fall back to JSON-based tool invocation.
+57K lines | 1,378 tests | zero warnings | zero panic paths | 15 MB idle RAM | 31ms cold start | [Benchmark report](docs/benchmarks/BENCHMARK_REPORT.md)
 
-59K lines | 1,334 tests | zero warnings | zero panic paths | 15 MB idle RAM | 31ms cold start | [Benchmark report](docs/benchmarks/BENCHMARK_REPORT.md)
+## What Makes SkyClaw Different
 
-## What It Does
+Most agent frameworks treat the LLM context window as a log file — append until it overflows, then truncate or summarize. SkyClaw treats it as **working memory** with a hard cognitive limit. This single insight shapes every architectural decision.
 
-SkyClaw is an autonomous AI agent that lives on your server and talks to you through messaging apps. It runs shell commands, browses the web, reads/writes files, fetches URLs, understands images, delegates sub-tasks, self-heals, and learns from its own mistakes — all controlled through natural conversation.
+### The Finite Brain Model
 
-No web dashboards. No config files to edit. Log in with your ChatGPT account or paste an API key in Telegram — and go.
+The context window is not a buffer. It is the total cognitive capacity available to the intelligence at any given moment. Every token consumed is a neuron recruited. Every token wasted is a thought the brain can no longer have.
 
-## AGENTIC CORE v2
+SkyClaw enforces this through three mechanisms:
 
-SkyClaw's intelligence layer — 20 modules driving an autonomous execution cycle, now with **smart complexity classification** that understands what kind of task you're asking before it starts working.
+**1. Every resource declares its cost.** Tool definitions, memory entries, blueprints, learnings — all carry pre-computed token counts stored in metadata at authoring time. No runtime estimation. The metabolic cost of every resource is known before it enters the context.
 
-### v2.1: LLM-Powered Chat/Order Classification
-
-Every inbound message is classified by a **single fast LLM call** that serves dual purpose — classify AND respond:
+**2. The brain sees its own budget.** Every context rebuild injects a Resource Budget Dashboard into the system prompt:
 
 ```
-Message arrives
-    ↓
-[LLM CLASSIFY] ─→ Chat  ──→ return response immediately (1 call total)
-                → Order ──→ send acknowledgment instantly
-                             ↓
-                         [PIPELINE] ─→ runs until done
-                                       (budget + time are the only limits)
+=== CONTEXT BUDGET ===
+Model: claude-sonnet-4-6 | Limit: 200,000 tokens
+Used: 34,200 tokens
+  System:     2,100
+  Tools:      3,400
+  Blueprint:  1,247
+  Memory:     1,200
+  Learnings:    450
+  History:   25,803
+Available: 165,800 tokens
+Blueprint budget: 18,753 / 20,000 remaining
+=== END BUDGET ===
 ```
 
-| What you say | Category | What happens |
-|-------------|----------|-------------|
-| "What's the capital of France?" | Chat | LLM answers directly. Done. 1 call. |
-| "Thanks!" / "Ok" | Chat | LLM responds naturally. Done. 1 call. |
-| "Open YouTube and search for news" | Order (standard) | User sees instant ack, pipeline runs. |
-| "Find a poem, translate it, export as DOCX" | Order (complex) | User sees instant ack, full pipeline with max context. |
+The LLM sees exactly how much context it has consumed and how much remains. A brain that doesn't know the size of its own skull will keep trying to think bigger thoughts until it crashes.
 
-**Key insight:** Chat messages never enter the tool loop — zero wasted tokens. Order messages get an instant acknowledgment so the user isn't staring at silence while the pipeline works. Multilingual — the LLM classifies and responds in the user's language. No artificial iteration caps — budget and time limits are the natural guardrails.
+**3. Graceful degradation over failure.** When a blueprint is too large for the budget, SkyClaw doesn't crash or silently overflow — it degrades through three tiers: full body (fits in 10% of budget) → outline only (10-25%) → catalog listing (>25%). The system always does the best it can with the resources it has.
 
-Fallback: if the LLM classify call fails (network error, parse failure), rule-based classification kicks in automatically.
+> Deep dive: [docs/design/COGNITIVE_ARCHITECTURE.md](docs/design/COGNITIVE_ARCHITECTURE.md)
 
-### Agent Loop
+### Blueprints — Procedural Memory, Not Fuzzy Summaries
+
+When an agent deploys an app to production — a 25-step procedure involving Docker builds, registry pushes, SSH connections, config edits, service restarts, and health checks — what does traditional summarization preserve?
+
+> *"Previously deployed the application to production using Docker and SSH."*
+
+This is useless. The agent that reads this summary will repeat every mistake, re-discover every dead end, and re-invent every workaround.
+
+Blueprints are SkyClaw's answer: structured, replayable procedure documents that capture the full execution graph. Not a description of what happened, but a **recipe for what to do** — with exact commands, verification steps, failure modes, and decision points. They self-heal through a CRUD refinement loop: create after a complex task, match on similar future tasks, execute, refine with what changed.
+
+| Summarization | Blueprint |
+|---------------|-----------|
+| "Deployed the app using Docker" | Phase 1: Build → `docker build -t app:v2 .`. Phase 2: Push → `docker push registry.io/app:v2`, verify manifest. Phase 3: Deploy → SSH, pull, compose up, verify `/health` returns 200 within 30s. |
+| Loses structure after compression | Preserves exact sequence, commands, verification steps |
+| Agent must re-derive the procedure | Agent follows the procedure directly |
+
+> Deep dive: [docs/design/BLUEPRINT_SYSTEM.md](docs/design/BLUEPRINT_SYSTEM.md)
+
+### Zero-Extra-LLM-Call Blueprint Matching
+
+The naive approach to blueprint matching is a dedicated LLM call: "Here are 5 blueprints — which one matches?" This adds latency, cost, and another failure point.
+
+SkyClaw eliminates this call entirely by piggybacking on the message classifier — an LLM call that already runs on every inbound message. One extra JSON field (`blueprint_hint`) costs ~20 tokens and replaces an entire matching call.
+
+The trick: **grounded vocabularies**. Before the classifier runs, a SQL query fetches the actual stored blueprint categories. The classifier picks from this set — never invents categories. Two stages that need to agree on a value are constrained to pick from values the other stage actually has. Hallucinated categories are impossible by construction.
 
 ```
-ORDER ─→ THINK ─→ ACTION ─→ VERIFY ─┐
-                                      │
-          ┌───────────────────────────┘
-          │
-          ├─ DONE? ──→ yes ──→ LEARN ──→ END
-          │
-          └─ no ──→ THINK ─→ ACTION ─→ VERIFY ─→ ...
+User message → Classifier (existing call, +1 field) → blueprint_hint: "deployment"
+                                                          ↓
+                                               SQL fetch by category → matched blueprints
+                                                          ↓
+                                               Context builder injects best fit
 ```
 
-- **ORDER**: Inbound message decomposed into task graph
-- **THINK**: Context assembly — system prompt, tool defs, memory, knowledge, past learnings (5% budget)
-- **ACTION**: Tool execution — shell, browser, file ops, web fetch, git
-- **VERIFY**: Self-correction engine checks output, triggers strategy rotation on repeated failures
-- **DONE**: Measurable completion criteria, not assertions
-- **LEARN**: `extract_learnings()` analyzes tools used, failures, outcomes → stores `TaskLearning` in memory → injected into future THINK steps
+Total cost: ~2ms (two SQL queries) + ~20 tokens (one extra field). Zero extra LLM calls.
 
-| Category | Modules |
-|----------|---------|
-| **Resilience** | Zero panic paths in production code, circuit breaker with exponential backoff, per-message panic recovery, dead worker respawn with message re-dispatch, send retry (3 attempts), channel reconnection, 5s DB timeout, graceful SIGTERM drain, lock poison recovery, conversation persistence |
-| **Intelligence** | Task decomposition, self-correction, DONE criteria, cross-task learning, **complexity classification (v2)**, **prompt stratification (v2)** |
-| **Self-Healing** | Watchdog, state recovery, health-aware heartbeat, memory failover |
-| **Efficiency** | Output compression, system prompt optimization, tiered model routing, history pruning, **complexity-aware tool loop (v2)**, **execution profiles (v2)** |
-| **Autonomy** | Parallel tool execution, agent-to-agent delegation, proactive task initiation, adaptive system prompt |
-| **Multimodal** | Vision / image understanding (JPEG, PNG, GIF, WebP) |
+> Deep dive: [docs/design/BLUEPRINT_MATCHING_V2.md](docs/design/BLUEPRINT_MATCHING_V2.md)
 
-## Key Metrics
+### 4-Layer Panic Resilience
 
-| Metric | Value |
-|--------|-------|
-| **Lines of Rust** | 59,100 across 127 source files |
-| **Tests** | 1,334 passing, 0 failures |
-| **Clippy warnings** | 0 (CI gate: `-D warnings`) |
-| **Workspace crates** | 15 + 1 binary |
-| **Implemented features** | 52 across 10 phases |
-| **AGENTIC CORE modules** | 20 + 5 v2 modules |
-| **Traits (core)** | 14 shared trait definitions |
-| **AI providers** | 7 + Codex OAuth (Anthropic, OpenAI, Gemini, Grok, OpenRouter, Z.ai, MiniMax, [OpenAI Codex via OAuth](#codex-oauth)) |
-| **Messaging channels** | 4 ([Telegram](docs/channels/telegram.md), [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [CLI](docs/channels/cli.md)) |
-| **Agent tools** | 13 (shell, browser, file ops, web fetch, git, messaging, file transfer, memory manage, key manage, self_create_tool, mcp_manage, self_extend_tool, self_add_mcp) + custom script tools |
-| **MCP support** | stdio + HTTP transports, 14 built-in server registry, hot-loading, auto-restart |
-| **Encryption** | ChaCha20-Poly1305 + Ed25519 + AES-256-GCM (OTK) |
-| **Memory backends** | 3 (SQLite, Markdown, failover) |
-| **File storage** | 2 (local, S3/R2) |
-| **Observability** | OpenTelemetry, 6 predefined metrics |
-| **Security features** | Auto-whitelist, vault encryption, path traversal protection, force-push block, credential message deletion, 4-layer key validation, OTK secure key setup, secret output filter, UTF-8 safe string handling |
-| **Vision support** | JPEG, PNG, GIF, WebP (Anthropic + OpenAI formats) — graceful fallback on text-only models |
-| **Release profile** | `opt-level=z`, LTO, 1 codegen unit, stripped, `panic=unwind` |
-| **Minimum Rust version** | 1.82 (Edition 2021) |
-| **Binary size** | 9.3 MB (release, stripped, LTO) |
-| **Memory (idle)** | 15 MB RSS ([measured](docs/benchmarks/BENCHMARK_REPORT.md)) |
-| **Memory (peak, 3-turn chat)** | 17 MB RSS |
-| **Startup time** | 31 ms cold start ([benchmarked](docs/benchmarks/BENCHMARK_REPORT.md)) |
+The incident that shaped our architecture: Vietnamese text containing `ẹ` (a 3-byte UTF-8 character) was sliced at an invalid byte boundary in context truncation. With `panic = "abort"` (the Rust default for release builds), this killed the entire process. Every user saw permanent silence — no error message, no restart, no recovery.
 
-## Performance
+The fix isn't just "don't slice strings wrong." It's four layers of defense:
 
-SkyClaw is built for hyper-performance. Rust's zero-cost abstractions, async runtime, and aggressive release optimizations deliver server-grade capability at embedded-system resource usage. All SkyClaw numbers are **measured** from a live 3-turn conversation test — see the [full benchmark report](docs/benchmarks/BENCHMARK_REPORT.md) with raw logs.
+1. **Source elimination** — `char_indices()` everywhere, never `&str[..N]` on user text. All 6 historical instances fixed.
+2. **Per-message catch_unwind** — wraps `process_message()` in `AssertUnwindSafe + FutureExt::catch_unwind()`. Panics become error replies, not silent death.
+3. **Dead worker detection** — dispatcher detects when a worker's channel is dead, removes the slot, fresh worker spawns on next message.
+4. **Global panic hook** — routes all panics through `tracing::error!` with file:line location.
+
+Plus: `panic = "unwind"` in the release profile (not `"abort"`), session rollback on panic to prevent history corruption, and conversation persistence across restarts.
+
+### Single-Call Classification
+
+Every inbound message is classified by one fast LLM call that does double duty — classify AND respond:
+
+- **Chat** → LLM answers directly. Done. 1 call total. Never enters the tool loop.
+- **Order** → User sees an instant acknowledgment while the agent pipeline runs in the background.
+- **Stop** → Agent halts current work immediately.
+
+No artificial iteration caps. Budget and wall-clock time are the natural guardrails. If the LLM classifier fails (network, auth, rate limit), rule-based classification kicks in — the system degrades to keywords rather than dropping the message.
+
+### 80x Less Memory Than OpenClaw
 
 | Metric | SkyClaw (Rust) | OpenClaw (TypeScript) | ZeroClaw (Rust) |
 |--------|---------------|----------------------|-----------------|
 | **Idle RAM** | **15 MB** | ~1,200 MB | ~4 MB |
 | **Peak RAM (3-turn chat)** | **17 MB** | ~1,500 MB+ | ~8 MB |
-| **Binary / Install** | **9.3 MB** single binary | ~800 MB (npm + node_modules) | ~12 MB |
+| **Binary size** | **9.6 MB** single binary | ~800 MB (npm + node_modules) | ~12 MB |
 | **Cold start** | **31 ms** | ~8,000 ms | <10 ms |
-| **Gateway ready** | **1.4 s** (MCP-bound) | ~10 s | <100 ms |
-| **Runtime** | Native arm64/x86_64 | Node.js V8 | Native |
-| **Dependencies** | 0 runtime deps | npm ecosystem | 0 runtime deps |
-| **Memory under load** | Flat (15-17 MB) | Grows over time | Flat |
 
-**80x less memory than OpenClaw.** Runs on a 512 MB VPS where OpenClaw cannot even start (needs 1.5 GB minimum). Memory stays flat under load — no GC pauses, no accumulation, deterministic allocation.
+Runs on a $5/month 512 MB VPS where OpenClaw cannot even start. Memory stays flat under load — no GC pauses, no accumulation. All numbers [measured from live conversations](docs/benchmarks/BENCHMARK_REPORT.md), not theoretical.
 
-> **Methodology:** SkyClaw numbers measured on Apple Silicon (arm64), macOS Darwin 23.6.0, release build with LTO. RSS sampled every 2s via `ps`. OpenClaw/ZeroClaw numbers from published benchmarks ([source 1](https://juliangoldie.com/zeroclaw-vs-openclaw/), [source 2](https://zeroclaws.io/blog/zeroclaw-vs-openclaw-vs-picoclaw-2026/), [source 3](https://advenboost.com/en/openclaw-hardware-requirements/)). Full raw data: [`docs/benchmarks/`](docs/benchmarks/).
+### Self-Extending Tool System
+
+The agent discovers and installs its own tools at runtime through MCP (Model Context Protocol):
+
+```
+User: "Search the web for latest Rust news"
+  → Agent calls self_extend_tool(query="web search")
+  → Returns: brave-search, fetch (ranked by relevance)
+  → Agent installs fetch server
+  → New HTTP tools available instantly
+  → Task completed with tools that didn't exist 10 seconds ago
+```
+
+14 built-in MCP servers in the registry. The agent also writes its own bash/python/node tools via `self_create_tool` — persisted to disk, available across sessions, no restart needed.
+
+### Codex OAuth — Your ChatGPT Subscription as an API
+
+No API key? No billing page? If you have ChatGPT Plus or Pro, just log in:
+
+```bash
+skyclaw auth login    # opens browser → log into ChatGPT → done
+skyclaw start         # auto-detects OAuth, goes online with gpt-5.4
+```
+
+Switch models live in Telegram with `/model`. Tokens last ~10 days, auto-refresh through the volume mount in Docker deployments.
 
 ## Setup
 
-There are two ways to connect SkyClaw to an AI provider. Pick whichever works for you.
+Choose your path:
 
-### Option A: ChatGPT Login (easiest — no API key needed)
+- **[Setup for Beginners](SETUP_FOR_NEWBIE.md)** — step-by-step walkthrough with screenshots and explanations. Start here if you're new to Rust or self-hosted AI agents.
+- **[Setup for Pros](SETUP_FOR_PROS.md)** — quick reference. Clone, build, configure, deploy. Assumes you know Rust, Docker, and VPS management.
 
-If you have a ChatGPT Plus or Pro subscription, you can use it directly. No API key, no billing page, no config files.
-
-**Step 1: Create a Telegram bot**
-
-1. Open Telegram and search for [@BotFather](https://t.me/BotFather)
-2. Send `/newbot`, pick a name and username (must end in `bot`)
-3. Copy the bot token BotFather gives you
-
-**Step 2: Build and authenticate**
+Quick start (30 seconds if you have Rust and a Telegram bot token):
 
 ```bash
-git clone https://github.com/nagisanzenin/skyclaw.git
-cd skyclaw
+git clone https://github.com/nagisanzenin/skyclaw.git && cd skyclaw
 cargo build --release
-./target/release/skyclaw auth login
-```
-
-A browser window opens — log into your ChatGPT account. That's it.
-
-```
-  Authenticated successfully!
-  Email:   you@gmail.com
-  Expires: 239h 59m
-  Model:   gpt-5.4 (default)
-
-  Run `skyclaw start` to go online.
-```
-
-**Step 3: Start and chat**
-
-```bash
-export TELEGRAM_BOT_TOKEN="your-token-here"
+export TELEGRAM_BOT_TOKEN="your-token"
+./target/release/skyclaw auth login   # ChatGPT OAuth (or skip and paste API key in Telegram)
 ./target/release/skyclaw start
 ```
-
-Open your bot in Telegram. Send a message. You're live.
-
-**Switching models:**
-
-Send `/model` in Telegram to see available models, or `/model gpt-5.3-codex` to switch.
-
-**Managing your session:**
-
-```bash
-skyclaw auth status     # check token validity and expiry
-skyclaw auth logout     # remove tokens
-skyclaw auth login      # re-authenticate when token expires (~10 days)
-```
-
-> On a headless server with no browser, use `skyclaw auth login --headless` — it prints a URL to open on any device, then you paste the redirect URL back.
->
-> For Docker/Kubernetes deployments, add `--output ./oauth.json` to export the token file for mounting into containers. See [Docker setup guide](docs/setup/docker-oauth.md).
-
-### Option B: API Key (any provider)
-
-If you have an API key from any supported provider, paste it directly in Telegram.
-
-**Step 1: Create a Telegram bot** (same as above)
-
-**Step 2: Deploy**
-
-```bash
-git clone https://github.com/nagisanzenin/skyclaw.git
-cd skyclaw
-cargo build --release
-export TELEGRAM_BOT_TOKEN="your-token-here"
-./target/release/skyclaw start
-```
-
-**Step 3: Activate**
-
-1. Open your bot in Telegram
-2. Send any message — SkyClaw sends you a secure setup link
-3. Click the link, paste your API key in the browser form — it encrypts locally
-4. Copy the encrypted blob back to chat — SkyClaw decrypts and validates
-5. Or just paste a raw API key directly — SkyClaw auto-detects the provider
-
-Supports: Anthropic, OpenAI, Gemini, Grok, OpenRouter, Z.ai, MiniMax
-
-### Running as a Daemon
-
-After completing setup (Option A or B), you can run SkyClaw in the background:
-
-```bash
-skyclaw start -d                     # daemonize, log to ~/.skyclaw/skyclaw.log
-skyclaw start -d --log /var/log/sk.log  # custom log path
-skyclaw stop                         # graceful shutdown
-```
-
-> **Important:** `--daemon` requires a completed setup. First-time users must run `skyclaw start` in the foreground to complete onboarding or run `skyclaw auth login` first.
-
-### Docker / Docker Compose
-
-Authenticate on your host machine, then mount the token file into the container:
-
-```bash
-# On your host machine
-skyclaw auth login --output ./oauth.json
-
-# docker-compose.yml
-#   volumes:
-#     - ./oauth.json:/root/.skyclaw/oauth.json
-#     - ./skyclaw.toml:/root/.skyclaw/skyclaw.toml
-```
-
-SkyClaw auto-detects the mounted token at startup. Tokens auto-refresh and persist through the volume mount.
-
-See [docs/setup/docker-oauth.md](docs/setup/docker-oauth.md) for the full guide (Kubernetes, headless servers, troubleshooting).
 
 ## Supported Providers
 
-Paste any of these API keys in Telegram — SkyClaw detects the provider automatically:
+Paste any API key in Telegram — SkyClaw detects the provider automatically:
 
 | Key Pattern | Provider | Default Model |
 |------------|----------|---------------|
@@ -260,169 +184,19 @@ Paste any of these API keys in Telegram — SkyClaw detects the provider automat
 | `AIzaSy*` | Google Gemini | gemini-3-flash-preview |
 | `xai-*` | xAI Grok | grok-4-1-fast-non-reasoning |
 | `sk-or-*` | OpenRouter | anthropic/claude-sonnet-4-6 |
-| *(explicit: `zai:KEY`)* | Z.ai (Zhipu) | glm-4.7-flash |
-| *(config only)* | MiniMax | MiniMax-M2.5 |
+| ChatGPT login | Codex OAuth | gpt-5.4 |
 
-### Codex OAuth
+Plus Z.ai and MiniMax via config. 50+ models in the registry with per-model context window and output token limits.
 
-Use your ChatGPT Plus/Pro subscription instead of an API key. No billing page, no usage limits — just your existing ChatGPT account.
+## Channels & Tools
 
-```bash
-skyclaw auth login          # opens browser, log into ChatGPT
-skyclaw start               # auto-detects OAuth tokens, goes online
-```
+**Channels:** [Telegram](docs/channels/telegram.md) | [Discord](docs/channels/discord.md) | [Slack](docs/channels/slack.md) | [CLI](docs/channels/cli.md)
 
-No config changes needed. SkyClaw detects your OAuth tokens at startup and connects automatically with `gpt-5.4`.
+**13 built-in tools:** Shell, stealth browser (anti-detection), file ops, web fetch, git, messaging, file transfer, memory CRUD, key management, MCP management, self-extend (discover + install MCP servers), self-add MCP, self-create tool (bash/python/node scripts persisted to disk).
 
-Switch models in Telegram with `/model`:
+**14 MCP servers** in the built-in registry (Playwright, PostgreSQL, GitHub, Brave Search, etc.) — the agent discovers and installs them at runtime via `self_extend_tool`.
 
-| Model | Best for |
-|-------|----------|
-| `gpt-5.4` (default) | All tasks — chat, tools, browsing, file ops |
-| `gpt-5.3-codex` | Coding-focused tasks |
-| `gpt-5.2` | General purpose, reliable tool calling |
-| `gpt-5.2-codex` | Coding with older model |
-| `gpt-4.1` | Lighter tasks, faster responses |
-| `o4-mini` | Reasoning tasks |
-
-> **Note:** The `*-codex` models are coding-specialized and may skip tools for general-purpose tasks (web browsing, file creation). Use `gpt-5.4` or `gpt-5.2` for full agent functionality.
-
-Session management:
-
-```bash
-skyclaw auth status         # check token validity and expiry
-skyclaw auth logout         # remove tokens
-skyclaw auth login --headless  # for servers without a browser
-```
-
-Tokens last ~10 days. Re-run `auth login` when they expire. Stored at `~/.skyclaw/oauth.json`.
-
-## Channels
-
-| Channel | Status | Feature Flag | Setup Guide |
-|---------|--------|-------------|-------------|
-| **Telegram** | Production | `telegram` | [docs/channels/telegram.md](docs/channels/telegram.md) |
-| **Discord** | Production | `discord` | [docs/channels/discord.md](docs/channels/discord.md) |
-| **Slack** | Production | `slack` | [docs/channels/slack.md](docs/channels/slack.md) |
-| **CLI** | Built-in | — | [docs/channels/cli.md](docs/channels/cli.md) |
-
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| **Shell** | Run any command on your server |
-| **Browser** | Stealth headless Chrome — anti-detection patches, session persistence, navigate, click, type, screenshot |
-| **File ops** | Read, write, list files on the server |
-| **Web fetch** | HTTP GET with token-budgeted response extraction |
-| **Git** | Clone, pull, push, commit, branch, diff, log |
-| **Messaging** | Send real-time updates during multi-step tasks |
-| **File transfer** | Send/receive files through messaging channels |
-| **Memory manage** | Persistent knowledge CRUD — remember, recall, forget, update, list |
-| **Key manage** | Generates secure setup links for API key onboarding — agent can send OTK links directly |
-| **MCP manage** | Add, remove, restart, and list MCP servers at runtime |
-| **Self-extend** | Discover MCP servers by capability — built-in registry of 14 servers with keyword search |
-| **Self-add MCP** | Install an MCP server to gain new tools — the agent extends its own capabilities on demand |
-| **Self-create tool** | Author custom bash/python/node tools at runtime — persisted to `~/.skyclaw/custom-tools/` across sessions |
-
-## Custom Tool Authoring
-
-The agent can write its own tools at runtime. When it encounters a repeatable task, it creates a script tool that persists across sessions.
-
-```
-User: "I keep asking you to check my server status. Can you make a tool for that?"
-         ↓
-Agent calls self_create_tool(action="create", name="check_status", language="bash",
-    script="#!/bin/bash\ncurl -s http://myserver:8080/health | jq .", ...)
-         ↓
-Tool 'check_status' saved to ~/.skyclaw/custom-tools/
-         ↓
-Available immediately — no restart needed
-```
-
-- **Languages:** bash, python, node
-- **I/O:** Script receives JSON input via stdin, writes output to stdout
-- **Timeout:** 30 seconds per execution
-- **Hot-reload:** New tools are available on the next message cycle
-- **Management:** `self_create_tool(action="list")` and `self_create_tool(action="delete", name="...")`
-
-## MCP — Self-Extending Tool System
-
-SkyClaw is an MCP (Model Context Protocol) client. It connects to external MCP servers, discovers their tools, and exposes them as native agent tools. The agent can extend its own capabilities at runtime — no restart, no config files.
-
-### How It Works
-
-```
-User: "Search the web for latest Rust news"
-         ↓
-Agent calls self_extend_tool(query="web search")
-         ↓
-Returns: brave-search, fetch (ranked by relevance)
-         ↓
-Agent: "I'll install the Fetch MCP server for web requests."
-         ↓
-Agent calls self_add_mcp(name="fetch", command="npx", args=["-y", "@modelcontextprotocol/server-fetch"])
-         ↓
-New HTTP tools available instantly
-         ↓
-Agent uses them to complete the task
-```
-
-### Built-in MCP Server Registry
-
-| Server | Capability | Command |
-|--------|-----------|---------|
-| Playwright | Browser automation | `npx @playwright/mcp@latest` |
-| Filesystem | Sandboxed file access | `npx -y @modelcontextprotocol/server-filesystem <path>` |
-| PostgreSQL | SQL database queries | `npx -y @modelcontextprotocol/server-postgres` |
-| SQLite | Local database | `npx -y @modelcontextprotocol/server-sqlite` |
-| GitHub | Repos, issues, PRs | `npx -y @modelcontextprotocol/server-github` |
-| Brave Search | Web search | `npx -y @modelcontextprotocol/server-brave-search` |
-| Puppeteer | Headless Chrome | `npx -y @modelcontextprotocol/server-puppeteer` |
-| Memory | Knowledge graph | `npx -y @modelcontextprotocol/server-memory` |
-| Fetch | HTTP requests | `npx -y @modelcontextprotocol/server-fetch` |
-| Slack | Team messaging | `npx -y @modelcontextprotocol/server-slack` |
-| Redis | Key-value cache | `npx -y @modelcontextprotocol/server-redis` |
-| Sequential Thinking | Structured reasoning | `npx -y @modelcontextprotocol/server-sequential-thinking` |
-| Google Maps | Geocoding, directions | `npx -y @modelcontextprotocol/server-google-maps` |
-| Everart | AI image generation | `npx -y @modelcontextprotocol/server-everart` |
-
-### Commands
-
-```
-/mcp                    List all connected MCP servers and their tools
-/mcp add <name> <cmd>   Add a stdio MCP server (e.g., /mcp add fetch npx -y @modelcontextprotocol/server-fetch)
-/mcp add <name> <url>   Add an HTTP MCP server
-/mcp remove <name>      Disconnect and remove a server
-/mcp restart <name>     Restart a crashed server
-```
-
-### Transports
-
-- **stdio** — launches a child process, communicates via stdin/stdout JSON-RPC
-- **HTTP** — connects to a remote MCP server via Streamable HTTP
-
-### Resilience
-
-- Timeouts on all JSON-RPC calls
-- Dead process detection with configurable auto-restart
-- Graceful degradation — MCP failure returns an error ToolOutput, never crashes the agent
-- Health monitoring with automatic reconnection
-- Tool name sanitization for cross-provider compatibility
-
-Config: `~/.skyclaw/mcp.toml`
-
-## Vision Support
-
-SkyClaw can see and understand images. Send a photo through any channel — the runtime automatically:
-
-1. Downloads the image to workspace
-2. Base64-encodes it
-3. Includes it as an image content part in the provider request
-4. The LLM sees and analyzes the image
-
-Supports Anthropic and OpenAI vision formats natively.
-
-**Graceful fallback**: If images are sent to a text-only model (e.g. GPT-3.5, MiniMax, GLM text models), SkyClaw strips the images automatically, notifies the user, and continues processing the text. No API errors — just a helpful message suggesting a vision-capable model.
+**Vision:** JPEG, PNG, GIF, WebP across all vision-capable models. Graceful fallback on text-only models — strips images, notifies user, continues.
 
 ## Architecture
 
@@ -430,16 +204,16 @@ Supports Anthropic and OpenAI vision formats natively.
 
 ```
 skyclaw (binary)
-├── skyclaw-core         Traits (13), types, config, errors
+├── skyclaw-core         Shared traits (13), types, config, errors
 ├── skyclaw-gateway      HTTP server, health, dashboard, OAuth identity
-├── skyclaw-agent        AGENTIC CORE (20 modules)
-├── skyclaw-providers    Anthropic, OpenAI-compatible
-├── skyclaw-codex-oauth  Codex OAuth — ChatGPT Plus/Pro via PKCE
+├── skyclaw-agent        AGENTIC CORE — 25 modules including blueprint system
+├── skyclaw-providers    Anthropic + OpenAI-compatible (7 providers via one adapter)
+├── skyclaw-codex-oauth  ChatGPT Plus/Pro via OAuth PKCE
 ├── skyclaw-channels     Telegram, Discord, Slack, CLI
-├── skyclaw-memory       SQLite + Markdown with failover
+├── skyclaw-memory       SQLite + Markdown with automatic failover
 ├── skyclaw-vault        ChaCha20-Poly1305 encrypted secrets
 ├── skyclaw-tools        Shell, browser, file ops, web fetch, git
-├── skyclaw-mcp          MCP client — self-extending tool system
+├── skyclaw-mcp          MCP client — stdio + HTTP, 14-server registry
 ├── skyclaw-skills       Skill registry (SkyHub v1)
 ├── skyclaw-automation   Heartbeat, cron scheduler
 ├── skyclaw-observable   OpenTelemetry, 6 predefined metrics
@@ -449,93 +223,46 @@ skyclaw (binary)
 
 ## Security
 
-- **Auto-whitelist**: First user to message gets whitelisted. Everyone else denied.
-- **Numeric ID only**: Allowlist matches on Telegram user IDs, not usernames.
-- **Vault encryption**: ChaCha20-Poly1305 with vault:// URI scheme for secrets.
+- **Deny-by-default**: First user auto-whitelisted. Everyone else denied. Numeric IDs only.
+- **Vault encryption**: ChaCha20-Poly1305 with `vault://` URI scheme for secrets at rest.
+- **OTK secure key setup**: API keys encrypted client-side via AES-256-GCM one-time key before transit. [Design doc](docs/OTK_SECURE_KEY_SETUP.md)
+- **Credential hygiene**: API keys auto-deleted from chat history after reading. Secret output filter prevents keys from leaking in agent replies.
 - **Path traversal protection**: File names sanitized, directory components stripped.
 - **Force-push blocked**: Git tool blocks destructive operations by default.
-- **Credential message deletion**: API keys and passwords are auto-deleted from chat history after reading.
-- **OTK secure key setup**: API keys encrypted client-side via AES-256-GCM before transit. [Design doc](docs/OTK_SECURE_KEY_SETUP.md)
-- **Secret output filter**: Hardcoded string-match censor prevents API keys from leaking in agent replies. System prompt enforces one-way secret flow (user → claw, never claw → user).
-
-## Self-Configuration
-
-Tell SkyClaw to change its own settings through natural language:
-
-- "Change model to claude-opus-4-6"
-- "Switch to GPT-5.2"
-
-Or use the `/model` command for mechanical model switching:
-
-- `/model` — show current model + all available models with `[vision]` tags
-- `/model gpt-5.2` — switch instantly (validates model name, takes effect immediately)
-
-The `/model` command is an escape hatch — it works even when the current model is too weak to follow self-configuration instructions. Proxy providers (OpenRouter, custom base_url) accept any model name.
-
-Config lives at `~/.skyclaw/credentials.toml` — SkyClaw reads and edits this file itself.
 
 ## CLI Reference
 
 ```
-skyclaw start              Start the gateway daemon
-skyclaw chat               Interactive CLI chat
-skyclaw status             Show running state
-skyclaw update             Check for updates and rebuild
-skyclaw auth login         Authenticate via OpenAI Codex OAuth (PKCE)
-skyclaw auth login --headless  Headless OAuth (paste redirect URL)
-skyclaw auth login --output ./oauth.json  Export token for Docker/remote deploy
-skyclaw auth status        Show OAuth token status
-skyclaw auth logout        Clear stored OAuth tokens
-skyclaw config validate    Validate configuration
-skyclaw config show        Print resolved config
-skyclaw version            Show version info
+skyclaw start                 Start the gateway (foreground or -d for daemon)
+skyclaw stop                  Graceful shutdown
+skyclaw chat                  Interactive CLI chat (works without API key for onboarding)
+skyclaw status                Show running state
+skyclaw update                Pull latest + rebuild release binary
+skyclaw auth login            Codex OAuth (browser or --headless)
+skyclaw auth login --output   Export OAuth token for Docker/K8s
+skyclaw auth status           Check token validity and expiry
+skyclaw auth logout           Clear stored OAuth tokens
+skyclaw config validate       Validate skyclaw.toml
+skyclaw config show           Print resolved config
 ```
-
-### `skyclaw update`
-
-Checks for new commits, pulls the latest code, and rebuilds the release binary in one command:
-
-```bash
-$ skyclaw update
-SkyClaw Update
-Current version: 2.4.0
-
-Fetching latest changes...
-3 new commit(s):
-
-  a1b2c3d feat: LLM-based message classification
-  d4e5f6g fix: orphaned tool_result in history pruning
-  h7i8j9k docs: update CLI reference
-
-Pulling from origin/main...
-Building release binary... (this may take a few minutes)
-
-Update complete!
-Restart with: skyclaw start
-```
-
-Handles dirty working trees automatically (stash → pull → build → pop). If you're not in a git repo, it tells you.
 
 ## Development
 
 ```bash
-cargo check --workspace                                    # Quick compilation check
-cargo build --workspace                                    # Debug build
-cargo test --workspace                                     # Run all 1334 tests
-cargo clippy --workspace --all-targets --all-features -- -D warnings  # Lint (0 warnings)
-cargo fmt --all                                            # Format
-cargo build --release                                      # Release build
+cargo check --workspace                                              # Quick check
+cargo test --workspace                                               # 1,378 tests
+cargo clippy --workspace --all-targets --all-features -- -D warnings # 0 warnings
+cargo fmt --all                                                      # Format
+cargo build --release                                                # Release binary
 ```
 
-## Requirements
-
-- Rust 1.82+
-- Chrome/Chromium (for browser tool)
-- A Telegram bot token
+Requires Rust 1.82+ and Chrome/Chromium (for the browser tool).
 
 ## Release Timeline
 
 ```
+2026-03-12  v2.5.0  ●━━━ Blueprint System — procedural memory for the agent (the Finite Brain Model), zero-extra-LLM-call matching via classifier hint + grounded vocabularies, resource budget dashboard injected into every context rebuild, 3-tier graceful degradation (full body → outline → catalog), self-healing blueprints via CRUD refinement loop, COGNITIVE_ARCHITECTURE.md design doc, 1378 tests
+                    │
 2026-03-11  v2.4.1  ●━━━ Codex OAuth polish — OAuth auto-detect at startup (no config change needed), /model + /keys Codex-aware, live model switching for Codex OAuth (agent hot-rebuild), callback port race condition fix, LLM classifier stop category, Codex Responses API probe validation, 1343 tests
                     │
 2026-03-11  v2.4.0  ●━━━ Interceptor Phase 1 — real-time task status observation via watch channel (AgentTaskStatus + AgentTaskPhase), CancellationToken infrastructure alongside AtomicBool interrupt, 10 status emission checkpoints in agent loop, prompted tool calling fallback for models without native function calling (#8), user-friendly error messages (no more raw JSON dumps), gpt-4o/gpt-3.5-turbo model registry entries, zero behavioral change (all Option — None = zero overhead), 1334 tests
